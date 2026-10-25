@@ -1,0 +1,23 @@
+{
+  "name": "lazypath",
+  "version": "0.1.0",
+  "description": "One endpoint for every LLM. OAuth login, zero API-key setup, automatic fallback.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "lazypath": "lazypath.ts"
+  },
+  "scripts": {
+    "start": "node lazypath.ts",
+    "dev": "node --watch lazypath.ts",
+    "test": "node test/e2e.mjs",
+    "typecheck": "tsc --noEmit lazypath.ts --target es2024 --module nodenext --moduleResolution nodenext --strict --skipLibCheck --types node"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
