@@ -3,7 +3,7 @@
 // stateless sessions across instances, and the local (no-database) fallback.
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -236,17 +236,34 @@ console.log(String(seen.providers.find((p) => p.id === "okmock")?.connected));
 
   // ---- a local gateway links into the very same database --------------------------------
   // The point of the store table: a provider linked in the process that *can* keep a poller
-  // alive lands in D1, and the deployment reads that row.
+  // alive lands in D1, and the deployment reads that row. It finds the database through
+  // .cloudflare.env only, with no CLOUDFLARE_* in its environment, which is how it is set up
+  // on a real machine.
   const LINK_HOME = mkdtempSync(join(tmpdir(), "lazypath-d1local-"));
+  writeFileSync(
+    join(LINK_HOME, ".cloudflare.env"),
+    [
+      "CLOUDFLARE_ACCOUNT_ID=testacc",
+      "CLOUDFLARE_D1_DATABASE_ID=testdb",
+      "CLOUDFLARE_API_TOKEN=test-cf-token",
+      `CLOUDFLARE_API_BASE=http://127.0.0.1:${D1_PORT}`,
+    ].join("\r\n"),
+  );
   const seededRow = store.get("token:pastedmock");
   const localLink = await new Promise(async (resolve) => {
     const env = { ...process.env, PORT: "8793", LAZYPATH_HOME: LINK_HOME };
     delete env.VERCEL;
+    for (const k of Object.keys(env)) if (k.startsWith("CLOUDFLARE_")) delete env[k];
     const child = spawn(process.execPath, ["lazypath.ts"], { env, stdio: "ignore" });
     try {
+      let up = null;
       for (let i = 0; i < 120; i++) {
         try {
-          if ((await fetch("http://127.0.0.1:8793/api/summary")).ok) break;
+          const r = await fetch("http://127.0.0.1:8793/api/summary");
+          if (r.ok) {
+            up = await r.json();
+            break;
+          }
         } catch {
           /* not listening yet */
         }
@@ -257,18 +274,19 @@ console.log(String(seen.providers.find((p) => p.id === "okmock")?.connected));
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ provider: "pastedmock", code: "good-code" }),
       });
-      resolve(await r.text());
+      resolve({ summary: up, body: await r.text() });
     } catch (e) {
-      resolve(`local gateway never came up: ${String(e)}`);
+      resolve({ summary: null, body: `local gateway never came up: ${String(e)}` });
     } finally {
       child.kill();
       rmSync(LINK_HOME, { recursive: true, force: true });
     }
   });
+  check("a local gateway finds the database in .cloudflare.env", localLink.summary?.accountMode === "cloudflare", JSON.stringify(localLink.summary?.accountMode));
   check(
     "a local gateway writes its link into the shared database",
-    localLink.includes('"ok":true') && String(store.get("token:pastedmock")) !== String(seededRow),
-    localLink.slice(0, 90),
+    localLink.body.includes('"ok":true') && String(store.get("token:pastedmock")) !== String(seededRow),
+    localLink.body.slice(0, 90),
   );
 
   // ---- a dead database degrades to an error page, not a crash -----------------------------

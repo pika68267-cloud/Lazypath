@@ -101,7 +101,8 @@ const USAGE_FILE = join(DATA_DIR, "usage.json");
 const cfEnvFile = join(DATA_DIR, ".cloudflare.env");
 if (existsSync(cfEnvFile)) {
   for (const line of readFileSync(cfEnvFile, "utf8").split(/\r?\n/)) {
-    const m = /^\s*(CLOUDFLARE_[A-Z_]+)\s*=\s*(.*?)\s*$/.exec(line);
+    // digits allowed: the documented name is CLOUDFLARE_D1_DATABASE_ID
+    const m = /^\s*(CLOUDFLARE_[A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
     if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
   }
 }

@@ -277,7 +277,7 @@ requests, so:
 ## Tests
 
 ```
-npm test          # 193 checks: every wire format, fallback, streaming, presets, usage, auth,
+npm test          # 195 checks: every wire format, fallback, streaming, presets, usage, auth,
                   # serverless mode, D1 accounts and D1 tokens, then the artifact Vercel runs
 npm run typecheck
 ```
@@ -288,7 +288,8 @@ npm run typecheck
 `test/accounts.mjs` stands up a mock Cloudflare D1 REST endpoint and proves the one-owner claim,
 scrypt-hashed storage, stateless sessions across a cold instance, the token table (env seed,
 a login saved from the deployed dashboard, a disconnect that sticks, a cold instance that reads
-the row straight out of D1), the local no-database fallback, and graceful 502s when the database
+the row straight out of D1, and a local gateway that finds the database only through
+`.cloudflare.env`), the local no-database fallback, and graceful 502s when the database
 is unreachable.
 `test/vercel-build.mjs` runs the build and drives `api/index.ts` → `lazypath.js`, so a `.ts`
 specifier or a config that throws at import time cannot reach the platform unnoticed.
