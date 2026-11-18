@@ -16,7 +16,7 @@ if (!connected.length) {
   process.exit(1);
 }
 
-const key = (await get("/api/summary")).gatewayKey;
+const key = (await get("/api/summary")).password;
 const models = await get("/v1/models");
 const id = connected[0];
 const model = models.data.find((m) => m.id.startsWith(id + "/"))?.id ?? id;

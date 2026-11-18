@@ -13,7 +13,7 @@ lazypath            # starts the gateway and opens the dashboard
   lazypath v0.1.0 up on http://127.0.0.1:8787
   dashboard  http://localhost:8787/
   openai api http://localhost:8787/v1   (model: smart | fast | cheap)
-  key        lp-...
+  login      admin / 3f9c2ab1...
 ```
 
 `node lazypath.ts` works exactly the same if you would rather not install it. Flags:
@@ -25,15 +25,19 @@ Single file, zero runtime dependencies, Node >= 24 (it runs the TypeScript direc
 Config, tokens and usage live in `~/.lazypath/` — delete that folder to reset.
 
 The dashboard is open on loopback because nothing else can reach it. Bind anywhere else
-(`--host 0.0.0.0`, or a Vercel deployment) and every page and API route asks for the gateway
-key first: `Authorization: Bearer lp-...`, or the key-entry form at `/` which sets an
-`HttpOnly` cookie the dashboard then rides.
+(`--host 0.0.0.0`, or a Vercel deployment) and `/` becomes a **username + password** sign-in
+form. A correct sign-in sets an `HttpOnly` session cookie the dashboard then rides; the cookie
+holds a signature, not the password, and changing the password invalidates every session.
+
+The API takes the same credentials two ways: `Authorization: Bearer <password>` — so an OpenAI
+SDK works with `apiKey` set to the password — or `Authorization: Basic base64(user:password)`,
+which is what `curl -u user:password` sends.
 
 ## Use it
 
 ```bash
 curl http://localhost:8787/v1/chat/completions \
-  -H "Authorization: Bearer lp-yourkey" -H "content-type: application/json" \
+  -H "Authorization: Bearer yourpassword" -H "content-type: application/json" \
   -d '{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
@@ -128,18 +132,23 @@ still one source file. Vercel picks the script up by itself.
 
 | variable | what it is |
 | --- | --- |
-| `LAZYPATH_GATEWAY_KEY` | the `lp-...` key your apps send as `Authorization: Bearer`. Set it, or a cold start invents a new one and your callers break. |
+| `LAZYPATH_USER` | the sign-in username. Defaults to `admin`. |
+| `LAZYPATH_PASSWORD` | the sign-in password, and the bearer token your apps send. **Set it** — without it every cold start invents a new random password that is never shown, so nobody can sign in. The sign-in page says so when it is missing. |
 | `LAZYPATH_TOKENS` | the token store as JSON — this is what makes connections survive. Get it from `lazypath export` on your machine. |
 | `LAZYPATH_CONFIG` | optional: presets and the disabled list as JSON, same shape as `~/.lazypath/config.json`. |
 
+Pick a password you would be happy to see in an `Authorization` header, because that is where
+it ends up: `Bearer <password>` for OpenAI SDKs, or `curl -u "$LAZYPATH_USER:$LAZYPATH_PASSWORD"`.
+
 ```bash
 curl https://your-app.vercel.app/v1/chat/completions \
-  -H "Authorization: Bearer lp-yourkey" -H "content-type: application/json" \
+  -u "admin:yourpassword" -H "content-type: application/json" \
   -d '{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Open `https://your-app.vercel.app/` and it asks for that key before showing anything. The
-key becomes an `HttpOnly` cookie, so the dashboard works normally afterwards.
+Open `https://your-app.vercel.app/` and it asks for that username and password before showing
+anything. Signing in sets an `HttpOnly` session cookie, so the dashboard works normally
+afterwards. The form POSTs — the password never appears in a URL, a request log or your history.
 
 **What serverless changes.** There is no durable disk and no process that stays alive between
 requests, so:
@@ -158,14 +167,15 @@ requests, so:
   `export` prints live credentials. Treat its output like a password.
 - Platform keys and browser cookies paste fine on the deployed dashboard, and are the easiest
   thing to keep in `LAZYPATH_TOKENS` by hand.
-- Rotating the key from the dashboard is refused; change `LAZYPATH_GATEWAY_KEY` and redeploy.
+- Rotating the password from the dashboard is refused; change `LAZYPATH_PASSWORD` and redeploy.
+  Every existing session cookie stops working when you do, because the password signs them.
 - `vercel.json` sets `maxDuration: 60` so a streamed answer is not cut off. Raise it if your
   plan allows and your generations run longer.
 
 ## Tests
 
 ```
-npm test          # 114 checks: every wire format, fallback, streaming, presets, usage, auth,
+npm test          # 129 checks: every wire format, fallback, streaming, presets, usage, auth,
                   # then serverless mode, then the artifact Vercel actually runs
 npm run typecheck
 ```

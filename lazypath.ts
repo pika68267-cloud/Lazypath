@@ -4,7 +4,7 @@
 // Single file, zero runtime dependencies. Node >= 24:  node lazypath.ts
 // Data (config, tokens, usage) lives in ~/.lazypath/ — delete that folder to reset.
 
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -73,7 +73,8 @@ interface Presets {
 }
 
 interface Config {
-  gatewayKey: string;
+  user: string;
+  password: string;
   port: number;
   deviceId: string;
   disabled: string[];
@@ -138,13 +139,16 @@ function loadConfig(): Config {
     }
     cfg.deviceId ??= randomBytes(16).toString("hex");
     cfg.port ??= 8787;
-    // the env key is what the caller's app is configured with, so it outranks any
-    // key a warm instance happened to generate before the env var was set
-    cfg.gatewayKey = process.env.LAZYPATH_GATEWAY_KEY ?? cfg.gatewayKey ?? `lp-${randomBytes(16).toString("hex")}`;
+    // the env credentials are what the caller's app is configured with, so they outrank
+    // anything a warm instance happened to generate before the env vars were set.
+    // `||` not `??`: an env var set to the empty string must not become an empty password.
+    cfg.user = process.env.LAZYPATH_USER || cfg.user || "admin";
+    cfg.password = process.env.LAZYPATH_PASSWORD || cfg.password || randomBytes(16).toString("hex");
     return cfg;
   }
   const cfg: Config = {
-    gatewayKey: process.env.LAZYPATH_GATEWAY_KEY ?? `lp-${randomBytes(16).toString("hex")}`,
+    user: process.env.LAZYPATH_USER || "admin",
+    password: process.env.LAZYPATH_PASSWORD || randomBytes(16).toString("hex"),
     port: 8787,
     deviceId: randomBytes(16).toString("hex"),
     disabled: [],
@@ -3765,7 +3769,7 @@ const HTML = String.raw`<!doctype html>
   <div class="card" id="faas" style="display:none;margin-bottom:6px;border-color:#7c5a12"></div>
 
   <div class="card row" style="margin-bottom:6px">
-    <div class="grow"><div class="wait">Gateway key</div><code id="k"></code></div>
+    <div class="grow"><div class="wait">Gateway login</div><code id="k"></code></div>
     <span class="kbd" onclick="copyKey()">copy</span>
     <button class="ghost" id="rot" onclick="act('rotate',{}).then(load)">rotate</button>
   </div>
@@ -3849,7 +3853,7 @@ function card(p){
 }
 function render(){
   renderChips();
-  document.getElementById("k").textContent=S.gatewayKey;
+  document.getElementById("k").textContent=S.user+" / "+S.password;
   var f=document.getElementById("faas");
   if(S.serverless){
     f.style.display="";
@@ -3857,7 +3861,7 @@ function render(){
     document.getElementById("rot").style.display="none";
   }
   S._max=Math.max(1,S.providers.reduce(function(a,p){return Math.max(a,p.usage.requests)},0));
-  document.getElementById("curl").textContent='curl '+S.baseUrl+'/v1/chat/completions \\\n  -H "Authorization: Bearer '+S.gatewayKey+'" \\\n  -H "content-type: application/json" \\\n  -d \'{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}\'';
+  document.getElementById("curl").textContent='curl '+S.baseUrl+'/v1/chat/completions \\\n  -H "Authorization: Bearer '+S.password+'" \\\n  -H "content-type: application/json" \\\n  -d \'{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}\'';
   var groups={};
   S.providers.filter(visible).forEach(function(p){(groups[p.group]=groups[p.group]||[]).push(p)});
   var host=document.getElementById("groups");host.innerHTML="";
@@ -3955,7 +3959,7 @@ async function finish(id){
   await act("finish",{provider:id,code:v});
   load(true);
 }
-async function copyKey(){navigator.clipboard.writeText(S.gatewayKey)}
+async function copyKey(){navigator.clipboard.writeText(S.password)}
 async function load(force){
   var s=await(await fetch("/api/summary")).json();
   var sig=JSON.stringify(s);
@@ -3976,7 +3980,8 @@ function summary(base: string) {
   const usage = readJson<Record<string, UsageRow>>(USAGE_FILE, {});
   const cfg = loadConfig();
   return {
-    gatewayKey: cfg.gatewayKey,
+    user: cfg.user,
+    password: cfg.password,
     presets: cfg.presets,
     baseUrl: base,
     serverless: SERVERLESS,
@@ -4075,7 +4080,7 @@ const HOST = argValue("host") ?? process.env.HOST ?? "127.0.0.1";
 const OPEN = !ARGS.includes("--no-open") && process.env.LAZYPATH_NO_OPEN !== "1";
 /** On loopback nothing else can reach the dashboard, so it stays open. Anywhere else -
  *  Vercel, or --host 0.0.0.0 - those same routes would let a stranger read your usage,
- *  paste their own cookies, disconnect your providers or rotate your key. */
+ *  paste their own cookies, disconnect your providers or rotate your password. */
 const PUBLIC = SERVERLESS || !["127.0.0.1", "::1", "localhost"].includes(HOST);
 
 function json(res: ServerResponse, status: number, value: unknown) {
@@ -4083,21 +4088,51 @@ function json(res: ServerResponse, status: number, value: unknown) {
   res.end(JSON.stringify(value));
 }
 
-const KEY_GATE = String.raw`<!doctype html><meta charset="utf-8"><title>lazypath</title>
+/** `note` is only ever one of the fixed strings below, never anything the visitor sent. */
+function gatePage(note: string) {
+  return String.raw`<!doctype html><meta charset="utf-8"><title>lazypath</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#05070b;color:#e6edf3;font:14px system-ui,sans-serif}
-form{display:flex;gap:8px;align-items:flex-end;padding:24px;border:1px solid #232c3d;border-radius:14px;background:#0b0f16}
-input{font:13px ui-monospace,Consolas,monospace;background:#05070b;border:1px solid #232c3d;color:#e6edf3;border-radius:8px;padding:9px 11px;width:280px}
+form{display:grid;gap:10px;width:280px;padding:24px;border:1px solid #232c3d;border-radius:14px;background:#0b0f16}
+input{font:13px ui-monospace,Consolas,monospace;background:#05070b;border:1px solid #232c3d;color:#e6edf3;border-radius:8px;padding:9px 11px}
 button{font:13px system-ui;background:#2f6f63;color:#fff;border:0;border-radius:8px;padding:9px 14px;cursor:pointer}
-p{margin:0 0 12px;color:#8b98a9;font-size:12px}</style>
-<form method="get" action="/"><div><p>This gateway is not on loopback. Enter its key to open the dashboard.</p>
-<input name="key" type="password" placeholder="lp-..." autofocus autocomplete="off"></div><button>Open</button></form>`;
+p{margin:0;color:#8b98a9;font-size:12px}
+p.err{color:#f87171}</style>
+<form method="post" action="/"><p>This gateway is not on loopback. Sign in to open the dashboard.</p>
+${note ? `<p class="err">${note}</p>` : ""}<input name="user" placeholder="username" autofocus autocomplete="username" autocapitalize="off" spellcheck="false">
+<input name="password" type="password" placeholder="password" autocomplete="current-password">
+<button>Sign in</button></form>`;
+}
+
+const NO_PASSWORD_SET = "No LAZYPATH_PASSWORD is set on this deployment, so there is nothing to sign in with. Add it in the project's environment variables and redeploy.";
+
+function sameSecret(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+/** Stateless on purpose: an instance that never saw the sign-in still has to verify the
+ *  cookie, and because the password is the HMAC key, changing it drops every session. */
+const sessionToken = (cfg: Config) => createHmac("sha256", cfg.password).update(`lazypath.session.${cfg.user}`).digest("hex");
+
+/** The password doubles as the bearer token so OpenAI SDKs keep working with apiKey set
+ *  to it; Basic is there for curl -u and anything else that speaks it natively. */
+function credentialed(req: IncomingMessage): boolean {
+  const cfg = loadConfig();
+  const header = req.headers.authorization ?? "";
+  if (header.startsWith("Basic ")) {
+    const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+    const cut = decoded.indexOf(":");
+    return cut > 0 && sameSecret(decoded.slice(0, cut), cfg.user) && sameSecret(decoded.slice(cut + 1), cfg.password);
+  }
+  if (header.startsWith("Bearer ")) return sameSecret(header.slice(7), cfg.password);
+  return sameSecret(cookieValue(req.headers.cookie ?? "", "lp_session"), sessionToken(cfg));
+}
 
 function authed(req: IncomingMessage): boolean {
-  if (!PUBLIC) return true;
-  const key = loadConfig().gatewayKey;
-  if ((req.headers.authorization ?? "") === `Bearer ${key}`) return true;
-  return cookieValue(req.headers.cookie ?? "", "lp_key") === key;
+  return !PUBLIC || credentialed(req);
 }
 
 async function readBody(req: IncomingMessage) {
@@ -4126,26 +4161,30 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     return res.end();
   }
   try {
-    if (req.method === "GET" && url.pathname === "/") {
-      // The key-entry form GETs here. A correct key becomes an HttpOnly cookie so the
-      // dashboard's own same-origin fetches ride it without any client-side change.
-      const offered = url.searchParams.get("key");
-      if (offered !== null && offered === loadConfig().gatewayKey) {
-        res.writeHead(302, {
-          location: "/",
-          "set-cookie": `lp_key=${offered}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${SERVERLESS ? "; Secure" : ""}`,
-        });
-        return res.end();
+    if (url.pathname === "/" && (req.method === "GET" || req.method === "POST")) {
+      if (req.method === "POST") {
+        // POST, not GET: a password in the query string lands in request logs and history.
+        const form = new URLSearchParams(await readBody(req));
+        const cfg = loadConfig();
+        if (sameSecret(form.get("user") ?? "", cfg.user) && sameSecret(form.get("password") ?? "", cfg.password)) {
+          res.writeHead(302, {
+            location: "/",
+            "set-cookie": `lp_session=${sessionToken(cfg)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${SERVERLESS ? "; Secure" : ""}`,
+          });
+          return res.end();
+        }
+        res.writeHead(401, { "content-type": "text/html" });
+        return res.end(gatePage("Wrong username or password."));
       }
       if (authed(req)) {
         res.writeHead(200, { "content-type": "text/html" });
         return res.end(HTML);
       }
-      res.writeHead(offered === null ? 200 : 401, { "content-type": "text/html" });
-      return res.end(KEY_GATE);
+      res.writeHead(200, { "content-type": "text/html" });
+      return res.end(gatePage(SERVERLESS && !process.env.LAZYPATH_PASSWORD ? NO_PASSWORD_SET : ""));
     }
     if (!authed(req) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models")) {
-      return json(res, 401, { error: { message: "bad lazypath key" } });
+      return json(res, 401, { error: { message: "bad lazypath login" } });
     }
     if (url.pathname === "/api/summary") return json(res, 200, summary(base));
 
@@ -4220,15 +4259,15 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 200, { ok: true });
       }
       if (url.pathname === "/api/rotate") {
-        // A rotated key would not survive the next cold start, and every app calling this
-        // gateway is configured with the env key - rotating here would just break them.
+        // A rotated password would not survive the next cold start, and every app calling
+        // this gateway is configured with the env one - rotating here would just break them.
         if (SERVERLESS) {
-          return json(res, 400, { error: { message: "the key comes from LAZYPATH_GATEWAY_KEY here; change it in the Vercel project settings and redeploy" } });
+          return json(res, 400, { error: { message: "the password comes from LAZYPATH_PASSWORD here; change it in the Vercel project settings and redeploy" } });
         }
         const cfg = loadConfig();
-        cfg.gatewayKey = `lp-${randomBytes(16).toString("hex")}`;
+        cfg.password = randomBytes(16).toString("hex");
         saveConfig(cfg);
-        return json(res, 200, { gatewayKey: cfg.gatewayKey });
+        return json(res, 200, { password: cfg.password });
       }
       if (url.pathname === "/api/usage/reset") {
         writeJson(USAGE_FILE, {});
@@ -4242,8 +4281,8 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     }
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-      if ((req.headers.authorization ?? "") !== `Bearer ${loadConfig().gatewayKey}`) {
-        return json(res, 401, { error: { message: "bad lazypath key" } });
+      if (!credentialed(req)) {
+        return json(res, 401, { error: { message: "bad lazypath login" } });
       }
       const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
       const model = String(body.model ?? "smart");
@@ -4351,7 +4390,7 @@ if (!SERVERLESS) {
     const probeHost = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
     try {
       const r = await fetch(`http://${probeHost}:${PORT}/api/summary`, {
-        headers: { authorization: `Bearer ${loadConfig().gatewayKey}` },
+        headers: { authorization: `Bearer ${loadConfig().password}` },
         signal: AbortSignal.timeout(1500),
       });
       return r.ok;
@@ -4379,7 +4418,7 @@ if (!SERVERLESS) {
       console.log(`\n  lazypath v${VERSION} up on http://${HOST}:${PORT}`);
       console.log(`  dashboard  ${dashboard}`);
       console.log(`  openai api http://localhost:${PORT}/v1   (model: smart | fast | cheap)`);
-      console.log(`  key        ${loadConfig().gatewayKey}`);
+      console.log(`  login      ${loadConfig().user} / ${loadConfig().password}`);
       console.log(`  data       ${DATA_DIR}\n`);
       console.log(`  ctrl-c to stop\n`);
       if (OPEN) openBrowser(dashboard);

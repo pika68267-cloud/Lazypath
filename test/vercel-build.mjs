@@ -9,7 +9,8 @@ import { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 const HOME = mkdtempSync(join(tmpdir(), "lazypath-build-"));
-const KEY = "lp-build-test-key";
+const USER = "ops";
+const PASSWORD = "build-test-password";
 const HOSTHEADER = "lazypath.vercel.app";
 
 let failures = 0;
@@ -39,7 +40,8 @@ process.env.VERCEL = "1";
 process.env.LAZYPATH_HOME = HOME;
 process.env.LAZYPATH_MOCKS = "1";
 process.env.LAZYPATH_NO_OPEN = "1";
-process.env.LAZYPATH_GATEWAY_KEY = KEY;
+process.env.LAZYPATH_USER = USER;
+process.env.LAZYPATH_PASSWORD = PASSWORD;
 process.env.LAZYPATH_TOKENS = JSON.stringify({ okmock: { provider: "okmock", accessToken: "seeded-token", authMode: "oauth" } });
 delete process.env.PORT;
 delete process.env.HOST;
@@ -84,7 +86,7 @@ function call(method, path, { body, headers = {} } = {}) {
   });
 }
 
-const bearer = { authorization: `Bearer ${KEY}` };
+const bearer = { authorization: `Bearer ${PASSWORD}` };
 const mock = spawn(process.execPath, ["test/mock-provider.mjs"], { stdio: ["ignore", "pipe", "pipe"] });
 mock.stdout.on("data", () => {});
 mock.stderr.on("data", (d) => console.error("[mock] " + d.toString().trim()));
@@ -99,7 +101,7 @@ for (let i = 0; i < 60; i++) {
 
 try {
   const gate = await call("GET", "/");
-  check("built function serves the key gate", gate.status === 200 && gate.text().includes("Enter its key"), gate.text().slice(0, 90));
+  check("built function serves the sign-in gate", gate.status === 200 && gate.text().includes("Sign in to open the dashboard"), gate.text().slice(0, 90));
   check("built function rejects a keyless api call", (await call("GET", "/api/summary")).status === 401);
   const summary = (await call("GET", "/api/summary", { headers: bearer })).json();
   check("built function reports serverless mode", summary.serverless === true);
@@ -131,7 +133,7 @@ const res = new R();
 const done = new Promise((r) => res.on("finish", r));
 const req = Readable.from([]);
 req.method = "GET"; req.url = "/api/summary";
-req.headers = { host: "x.vercel.app", authorization: "Bearer " + process.env.LAZYPATH_GATEWAY_KEY };
+req.headers = { host: "x.vercel.app", authorization: "Bearer " + process.env.LAZYPATH_PASSWORD };
 await h(req, res); await done;
 console.log(res.status);
 `;
@@ -141,7 +143,7 @@ const hostile = [
   ["config is a number", "42", null],
   ["config is an array", "[]", null],
   ["config json is truncated", '{"presets":', null],
-  ["config file on disk is truncated", null, '{"gatewayKey":'],
+  ["config file on disk is truncated", null, '{"password":'],
 ];
 for (const [name, envValue, diskValue] of hostile) {
   const home = mkdtempSync(join(tmpdir(), "lazypath-hostile-"));
@@ -151,11 +153,21 @@ for (const [name, envValue, diskValue] of hostile) {
   }
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", probe], {
     encoding: "utf8",
-    env: { ...process.env, VERCEL: "1", LAZYPATH_HOME: home, LAZYPATH_GATEWAY_KEY: KEY, LAZYPATH_NO_OPEN: "1", LAZYPATH_MOCKS: "", LAZYPATH_CONFIG: envValue ?? "" },
+    env: { ...process.env, VERCEL: "1", LAZYPATH_HOME: home, LAZYPATH_USER: USER, LAZYPATH_PASSWORD: PASSWORD, LAZYPATH_NO_OPEN: "1", LAZYPATH_MOCKS: "", LAZYPATH_CONFIG: envValue ?? "" },
   });
   check(`survives ${name}`, r.status === 0 && r.stdout.trim() === "200", (r.stderr || r.stdout || "").trim().split("\n").slice(-2).join(" ").slice(0, 160));
   rmSync(home, { recursive: true, force: true });
 }
+
+// An unset password on serverless is a lockout, so the gate has to say so instead of
+// asking for a random secret that is regenerated on every cold start and never shown.
+const noPwHome = mkdtempSync(join(tmpdir(), "lazypath-nopw-"));
+const noPassword = spawnSync(process.execPath, ["--input-type=module", "-e", probe.replace('req.url = "/api/summary"', 'req.url = "/"').replace("console.log(res.status)", "console.log(Buffer.concat(res.parts).toString())")], {
+  encoding: "utf8",
+  env: { ...process.env, VERCEL: "1", LAZYPATH_HOME: noPwHome, LAZYPATH_PASSWORD: "", LAZYPATH_NO_OPEN: "1", LAZYPATH_MOCKS: "" },
+});
+check("an unset password is explained at the gate", noPassword.status === 0 && noPassword.stdout.includes("No LAZYPATH_PASSWORD is set"), (noPassword.stderr || "").trim().split("\n").slice(-2).join(" ").slice(0, 160));
+rmSync(noPwHome, { recursive: true, force: true });
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall vercel-build checks passed");
 process.exit(failures ? 1 : 0);

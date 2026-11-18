@@ -75,11 +75,17 @@ async function main() {
   await spawnAndWait(["lazypath.ts"], { LAZYPATH_HOME: TESTDIR, PORT: "8791", LAZYPATH_MOCKS: "1", LAZYPATH_NO_OPEN: "1" }, 8791, (s) => s === 200);
 
   const cfg = JSON.parse(readFileSync(join(TESTDIR, "config.json"), "utf8"));
-  const key = cfg.gatewayKey;
+  const key = cfg.password;
   const auth = { authorization: `Bearer ${key}` };
 
   const badKey = await post("/v1/chat/completions", { model: "smart", messages: [] }, { authorization: "Bearer nope" });
-  check("rejects wrong gateway key", badKey.status === 401);
+  check("rejects wrong gateway password", badKey.status === 401);
+
+  const basic = { authorization: "Basic " + Buffer.from(`${cfg.user}:${key}`).toString("base64") };
+  const viaBasic = await post("/v1/chat/completions", { model: "smart", messages: [{ role: "user", content: "hi" }] }, basic);
+  check("http basic auth is accepted too", viaBasic.status === 200, `got ${viaBasic.status}`);
+  const badBasic = await post("/v1/chat/completions", { model: "smart", messages: [] }, { authorization: "Basic " + Buffer.from(`${cfg.user}:nope`).toString("base64") });
+  check("basic auth with a wrong password is rejected", badBasic.status === 401);
 
   const noProviders = await post("/v1/chat/completions", { model: "smart", messages: [{ role: "user", content: "hi" }] }, auth);
   const noProvidersJson = await noProviders.json();
@@ -272,11 +278,11 @@ async function main() {
   const disconnected = await post("/api/disconnect", { provider: "pastedmock" });
   check("disconnect clears the token", disconnected.ok && !(await isConnected("pastedmock")));
 
-  const rotated = await (await post("/api/rotate", {})).json();  check("key rotation returns a new key", rotated.gatewayKey !== key);
+  const rotated = await (await post("/api/rotate", {})).json();  check("rotation returns a new password", rotated.password !== key);
   const oldKeyWorks = await post("/v1/chat/completions", { model: "smart", messages: [] }, auth);
-  check("old key rejected after rotation", oldKeyWorks.status === 401, `got ${oldKeyWorks.status}`);
-  const newKeyWorks = await post("/v1/chat/completions", { model: "smart", messages: [] }, { authorization: `Bearer ${rotated.gatewayKey}` });
-  check("new key accepted after rotation", newKeyWorks.status === 200 || newKeyWorks.status === 502, `got ${newKeyWorks.status}`);
+  check("old password rejected after rotation", oldKeyWorks.status === 401, `got ${oldKeyWorks.status}`);
+  const newKeyWorks = await post("/v1/chat/completions", { model: "smart", messages: [] }, { authorization: `Bearer ${rotated.password}` });
+  check("new password accepted after rotation", newKeyWorks.status === 200 || newKeyWorks.status === 502, `got ${newKeyWorks.status}`);
 }
 
 await main().catch((e) => {
