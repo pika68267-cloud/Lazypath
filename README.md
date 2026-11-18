@@ -1,5 +1,5 @@
 ## CREDIT:IMPORTANT
-  this is a standoff for fun prototype of [OMNIROUTE](https://github.com/cheaper-inference/OmniRoute/). I am not the author of the real project. All belongs to this great author[Diego Rodrigues de Sa e Souza](https://github.com/diegosouzapw)
+  this is a standoff for fun prototype of [OMNIROUTE](https://github.com/cheaper-inference/OmniRoute/). I am not the author of the real project. All belongs to this great author [Diego Rodrigues de Sa e Souza](https://github.com/diegosouzapw) and the Teams behind it
 
 
 # lazypath
