@@ -13,7 +13,7 @@
   "scripts": {
     "start": "node lazypath.ts",
     "dev": "node --watch lazypath.ts",
-    "test": "node test/e2e.mjs && node test/serverless.mjs && node test/vercel-build.mjs",
+    "test": "node test/e2e.mjs && node test/serverless.mjs && node test/accounts.mjs && node test/vercel-build.mjs",
     "typecheck": "tsc --noEmit",
     "vercel-build": "node build-vercel.mjs"
   },

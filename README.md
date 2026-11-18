@@ -25,9 +25,22 @@ Single file, zero runtime dependencies, Node >= 24 (it runs the TypeScript direc
 Config, tokens and usage live in `~/.lazypath/` — delete that folder to reset.
 
 The dashboard is open on loopback because nothing else can reach it. Bind anywhere else
-(`--host 0.0.0.0`, or a Vercel deployment) and `/` becomes a **username + password** sign-in
-form. A correct sign-in sets an `HttpOnly` session cookie the dashboard then rides; the cookie
-holds a signature, not the password, and changing the password invalidates every session.
+(`--host 0.0.0.0`, or a Vercel deployment) and `/` becomes a **home page** with **Sign in** and
+**Sign up** buttons. Sign-up creates the gateway's *single owner account* and then closes for
+good — the first person to claim it owns it, and everyone after that sees "Already claimed".
+Signing in sets an `HttpOnly` session cookie the dashboard then rides; the cookie holds a
+signature, not the password.
+
+Where the account lives depends on the deployment:
+
+- **Local (loopback):** sign-up writes the username and password you chose into
+  `~/.lazypath/config.json`, replacing the generated ones. No database needed.
+- **Cloudflare D1:** set the three `CLOUDFLARE_*` variables and the account is stored in a D1
+  database, so it survives serverless cold starts. The password is stored as a salted scrypt
+  hash, never in plaintext, and is never served back by the API. See
+  [Accounts in the cloud](#accounts-in-the-cloud).
+- **Env-managed:** set `LAZYPATH_PASSWORD` and sign-up is disabled — the credentials are whatever
+  the environment says, which is the simplest path for a personal deployment.
 
 The API takes the same credentials two ways: `Authorization: Bearer <password>` — so an OpenAI
 SDK works with `apiKey` set to the password — or `Authorization: Basic base64(user:password)`,
@@ -132,13 +145,40 @@ still one source file. Vercel picks the script up by itself.
 
 | variable | what it is |
 | --- | --- |
-| `LAZYPATH_USER` | the sign-in username. Defaults to `admin`. |
-| `LAZYPATH_PASSWORD` | the sign-in password, and the bearer token your apps send. **Set it** — without it every cold start invents a new random password that is never shown, so nobody can sign in. The sign-in page says so when it is missing. |
+| `LAZYPATH_USER` | the sign-in username for env-managed mode. Defaults to `admin`. Ignored when D1 accounts are on. |
+| `LAZYPATH_PASSWORD` | the sign-in password and bearer token for env-managed mode. Set it **or** set the `CLOUDFLARE_*` variables below — with neither, a public deployment has no way to sign in and the sign-in page says so. |
 | `LAZYPATH_TOKENS` | the token store as JSON — this is what makes connections survive. Get it from `lazypath export` on your machine. |
 | `LAZYPATH_CONFIG` | optional: presets and the disabled list as JSON, same shape as `~/.lazypath/config.json`. |
+| `CLOUDFLARE_ACCOUNT_ID` | enables D1 accounts: your Cloudflare account id. |
+| `CLOUDFLARE_D1_DATABASE_ID` | the D1 database that holds the owner account. |
+| `CLOUDFLARE_API_TOKEN` | a Cloudflare API token with D1 write access to that database. |
 
 Pick a password you would be happy to see in an `Authorization` header, because that is where
 it ends up: `Bearer <password>` for OpenAI SDKs, or `curl -u "$LAZYPATH_USER:$LAZYPATH_PASSWORD"`.
+
+### Accounts in the cloud
+
+Serverless has no durable disk, so an account created on one cold start would vanish on the
+next. Cloudflare D1 fixes that: the owner account lives in a database the function reads over
+Cloudflare's REST API (plain `fetch`, still zero dependencies). To turn it on:
+
+1. In the Cloudflare dashboard, **Workers & Pages > D1** and create a database (the free tier is
+   plenty — it stores one row).
+2. Create an API token with **Account > D1 > Edit** permission.
+3. Set `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID` and `CLOUDFLARE_API_TOKEN` in Vercel
+   and redeploy.
+
+The gateway creates the `accounts` table itself on first use. Open `/signup`, choose a username
+and password, and that single account is claimed atomically — a concurrent second sign-up loses
+the race and gets "Already claimed". The password is stored as a salted **scrypt** hash; the API
+never returns it, and the dashboard shows "the password you chose at sign-up" instead of a value
+to copy. Sign-in checks the password against the hash, and the same password works as the bearer
+token. Because the hash is in D1, every cold start verifies the same account and the same session
+cookies. Rotating the password from the dashboard is refused in this mode — it was chosen at
+sign-up; to change it, update the row in D1.
+
+If a public deployment has neither D1 nor `LAZYPATH_PASSWORD`, sign-up shows a "needs a database"
+notice rather than a form, because there is nowhere durable to put the account.
 
 ```bash
 curl https://your-app.vercel.app/v1/chat/completions \
@@ -146,9 +186,10 @@ curl https://your-app.vercel.app/v1/chat/completions \
   -d '{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Open `https://your-app.vercel.app/` and it asks for that username and password before showing
-anything. Signing in sets an `HttpOnly` session cookie, so the dashboard works normally
-afterwards. The form POSTs — the password never appears in a URL, a request log or your history.
+Open `https://your-app.vercel.app/` and you get the home page; **Sign up** claims the owner
+account (with D1) or **Sign in** takes the env credentials. Signing in sets an `HttpOnly` session
+cookie, so the dashboard works normally afterwards. The forms POST — the password never appears
+in a URL, a request log or your history.
 
 **What serverless changes.** There is no durable disk and no process that stays alive between
 requests, so:
@@ -167,22 +208,27 @@ requests, so:
   `export` prints live credentials. Treat its output like a password.
 - Platform keys and browser cookies paste fine on the deployed dashboard, and are the easiest
   thing to keep in `LAZYPATH_TOKENS` by hand.
-- Rotating the password from the dashboard is refused; change `LAZYPATH_PASSWORD` and redeploy.
-  Every existing session cookie stops working when you do, because the password signs them.
+- Rotating the password from the dashboard is refused. In env-managed mode, change
+  `LAZYPATH_PASSWORD` and redeploy; every existing session cookie stops working, because the
+  password signs them. In D1 mode the password was chosen at sign-up and lives hashed in the
+  database — update the row there to change it.
 - `vercel.json` sets `maxDuration: 60` so a streamed answer is not cut off. Raise it if your
   plan allows and your generations run longer.
 
 ## Tests
 
 ```
-npm test          # 129 checks: every wire format, fallback, streaming, presets, usage, auth,
-                  # then serverless mode, then the artifact Vercel actually runs
+npm test          # 183 checks: every wire format, fallback, streaming, presets, usage, auth,
+                  # serverless mode, D1 accounts, then the artifact Vercel actually runs
 npm run typecheck
 ```
 
 `test/mock-provider.mjs` is a local stub; mock providers only load with `LAZYPATH_MOCKS=1`.
 `test/e2e.mjs` drives a real gateway on a port; `test/serverless.mjs` imports the handler with
 `VERCEL=1` and drives it with mock req/res, because in that mode there is no port to bind.
+`test/accounts.mjs` stands up a mock Cloudflare D1 REST endpoint and proves the one-owner claim,
+scrypt-hashed storage, stateless sessions across a cold instance, the local no-database fallback,
+and graceful 502s when the database is unreachable.
 `test/vercel-build.mjs` runs the build and drives `api/index.ts` → `lazypath.js`, so a `.ts`
 specifier or a config that throws at import time cannot reach the platform unnoticed.
 

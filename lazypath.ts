@@ -4,7 +4,7 @@
 // Single file, zero runtime dependencies. Node >= 24:  node lazypath.ts
 // Data (config, tokens, usage) lives in ~/.lazypath/ — delete that folder to reset.
 
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -79,6 +79,8 @@ interface Config {
   deviceId: string;
   disabled: string[];
   presets: Presets;
+  /** set once someone claims this gateway through /signup; sign-up then closes */
+  accountCreated?: boolean;
 }
 
 // --------------------------------------------------------------------------- store
@@ -3770,8 +3772,9 @@ const HTML = String.raw`<!doctype html>
 
   <div class="card row" style="margin-bottom:6px">
     <div class="grow"><div class="wait">Gateway login</div><code id="k"></code></div>
-    <span class="kbd" onclick="copyKey()">copy</span>
+    <span class="kbd" id="cpy" onclick="copyKey()">copy</span>
     <button class="ghost" id="rot" onclick="act('rotate',{}).then(load)">rotate</button>
+    <button class="ghost" id="out" style="display:none" onclick="signOut()">sign out</button>
   </div>
 
   <h2>Usage</h2>
@@ -3853,15 +3856,18 @@ function card(p){
 }
 function render(){
   renderChips();
-  document.getElementById("k").textContent=S.user+" / "+S.password;
+  document.getElementById("k").textContent=S.password?S.user+" / "+S.password:S.user+" / (the password you chose at sign-up)";
+  document.getElementById("cpy").style.display=S.password?"":"none";
+  document.getElementById("out").style.display=S.public?"":"none";
   var f=document.getElementById("faas");
   if(S.serverless){
     f.style.display="";
-    f.innerHTML='<div class="wait">Serverless mode: there is no durable disk here, so a connection you make on this page lasts only until the next cold start. Put it in the <code>LAZYPATH_TOKENS</code> env var to keep it. Device-code logins need a process that stays alive - link those locally with <code>node lazypath.ts</code>, then copy them over with <code>lazypath export</code>.</div>';
+    f.innerHTML='<div class="wait">Serverless mode: there is no durable disk here, so a connection you make on this page lasts only until the next cold start. Put it in the <code>LAZYPATH_TOKENS</code> env var to keep it. Device-code logins need a process that stays alive - link those locally with <code>node lazypath.ts</code>, then copy them over with <code>lazypath export</code>.'+(S.accountMode==="cloudflare"?' Your sign-in account lives in Cloudflare D1, so it survives cold starts.':'')+'</div>';
     document.getElementById("rot").style.display="none";
   }
+  if(S.accountMode==="cloudflare")document.getElementById("rot").style.display="none";
   S._max=Math.max(1,S.providers.reduce(function(a,p){return Math.max(a,p.usage.requests)},0));
-  document.getElementById("curl").textContent='curl '+S.baseUrl+'/v1/chat/completions \\\n  -H "Authorization: Bearer '+S.password+'" \\\n  -H "content-type: application/json" \\\n  -d \'{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}\'';
+  document.getElementById("curl").textContent='curl '+S.baseUrl+'/v1/chat/completions \\\n  -H "Authorization: Bearer '+(S.password||"YOUR_PASSWORD")+'" \\\n  -H "content-type: application/json" \\\n  -d \'{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}\'';
   var groups={};
   S.providers.filter(visible).forEach(function(p){(groups[p.group]=groups[p.group]||[]).push(p)});
   var host=document.getElementById("groups");host.innerHTML="";
@@ -3959,7 +3965,8 @@ async function finish(id){
   await act("finish",{provider:id,code:v});
   load(true);
 }
-async function copyKey(){navigator.clipboard.writeText(S.password)}
+async function copyKey(){if(S.password)navigator.clipboard.writeText(S.password)}
+async function signOut(){await fetch("/signout",{method:"POST"});location.href="/"}
 async function load(force){
   var s=await(await fetch("/api/summary")).json();
   var sig=JSON.stringify(s);
@@ -3975,13 +3982,16 @@ setInterval(function(){load()},3000);
 
 // --------------------------------------------------------------------------- dashboard API
 
-function summary(base: string) {
+async function summary(base: string) {
   const tokens = tokenStore();
   const usage = readJson<Record<string, UsageRow>>(USAGE_FILE, {});
   const cfg = loadConfig();
+  const owner = D1 ? await ownerAccount().catch(() => null) : null;
   return {
-    user: cfg.user,
-    password: cfg.password,
+    user: D1 ? (owner?.username ?? "") : cfg.user,
+    password: D1 ? null : cfg.password,
+    accountMode: D1 ? "cloudflare" : "local",
+    public: PUBLIC,
     presets: cfg.presets,
     baseUrl: base,
     serverless: SERVERLESS,
@@ -4088,23 +4098,111 @@ function json(res: ServerResponse, status: number, value: unknown) {
   res.end(JSON.stringify(value));
 }
 
-/** `note` is only ever one of the fixed strings below, never anything the visitor sent. */
-function gatePage(note: string) {
-  return String.raw`<!doctype html><meta charset="utf-8"><title>lazypath</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#05070b;color:#e6edf3;font:14px system-ui,sans-serif}
-form{display:grid;gap:10px;width:280px;padding:24px;border:1px solid #232c3d;border-radius:14px;background:#0b0f16}
-input{font:13px ui-monospace,Consolas,monospace;background:#05070b;border:1px solid #232c3d;color:#e6edf3;border-radius:8px;padding:9px 11px}
-button{font:13px system-ui;background:#2f6f63;color:#fff;border:0;border-radius:8px;padding:9px 14px;cursor:pointer}
-p{margin:0;color:#8b98a9;font-size:12px}
-p.err{color:#f87171}</style>
-<form method="post" action="/"><p>This gateway is not on loopback. Sign in to open the dashboard.</p>
-${note ? `<p class="err">${note}</p>` : ""}<input name="user" placeholder="username" autofocus autocomplete="username" autocapitalize="off" spellcheck="false">
-<input name="password" type="password" placeholder="password" autocomplete="current-password">
-<button>Sign in</button></form>`;
+function html(res: ServerResponse, status: number, body: string) {
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8" });
+  res.end(body);
 }
 
-const NO_PASSWORD_SET = "No LAZYPATH_PASSWORD is set on this deployment, so there is nothing to sign in with. Add it in the project's environment variables and redeploy.";
+// --------------------------------------------------------------------------- accounts
+// One gateway, one owner. The first account created through /signup is the only
+// account; after that sign-up closes. With the CLOUDFLARE_* env vars set the account
+// lives in a D1 database over plain REST fetch (no SDK, no dependency), so it survives
+// serverless cold starts. Without them the account is the local config file, and on a
+// public host sign-up stays closed until a database or LAZYPATH_PASSWORD is configured.
+
+const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
+const CF_DB = process.env.CLOUDFLARE_D1_DATABASE_ID ?? "";
+const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
+const CF_API = (process.env.CLOUDFLARE_API_BASE || "https://api.cloudflare.com/client/v4").replace(/\/+$/, "");
+const D1 = !!(CF_ACCOUNT && CF_DB && CF_TOKEN);
+
+interface AccountRow {
+  username: string;
+  hash: string;
+}
+
+async function d1Query(sql: string, params: (string | number)[] = []) {
+  let r: Response;
+  try {
+    r = await fetch(`${CF_API}/accounts/${CF_ACCOUNT}/d1/database/${CF_DB}/query`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CF_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ sql, params }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (e) {
+    throw new Error(`Cloudflare D1 is unreachable: ${String(e)}`);
+  }
+  const j = (await r.json()) as {
+    success?: boolean;
+    errors?: { message?: string }[];
+    result?: { results?: Record<string, unknown>[]; meta?: { changes?: number } }[];
+  };
+  if (!r.ok || !j.success) throw new Error(`Cloudflare D1: ${j.errors?.[0]?.message ?? `HTTP ${r.status}`}`);
+  return j.result?.[0] ?? {};
+}
+
+let d1Schema: Promise<void> | null = null;
+function d1Ready(): Promise<void> {
+  if (!d1Schema) {
+    d1Schema = d1Query("CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, hash TEXT NOT NULL, created INTEGER NOT NULL)")
+      .then(() => {})
+      .catch((e) => {
+        d1Schema = null;
+        throw e;
+      });
+  }
+  return d1Schema;
+}
+
+async function ownerAccount(): Promise<AccountRow | null> {
+  if (!D1) return null;
+  await d1Ready();
+  const q = await d1Query("SELECT username, hash FROM accounts LIMIT 1");
+  const row = q.results?.[0];
+  return row ? { username: String(row.username), hash: String(row.hash) } : null;
+}
+
+/** scrypt, salted per account, stored as salt$hash - the plaintext password never lands in D1. */
+function hashPassword(password: string): string {
+  const salt = randomBytes(16).toString("hex");
+  return `${salt}$${scryptSync(password, salt, 64).toString("hex")}`;
+}
+
+function checkPassword(password: string, stored: string): boolean {
+  const cut = stored.indexOf("$");
+  if (!password || cut <= 0) return false;
+  const want = Buffer.from(stored.slice(cut + 1), "hex");
+  if (!want.length) return false;
+  const got = scryptSync(password, stored.slice(0, cut), want.length);
+  return timingSafeEqual(want, got);
+}
+
+/** Atomic claim: two strangers signing up at the same instant cannot both win. */
+async function claimAccount(username: string, password: string): Promise<boolean> {
+  await d1Ready();
+  const q = await d1Query("INSERT INTO accounts (username, hash, created) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM accounts)", [username, hashPassword(password), Date.now()]);
+  return (q.meta?.changes ?? 0) === 1;
+}
+
+type SignupState = "open" | "claimed" | "env" | "needsdb";
+
+async function signupState(): Promise<SignupState> {
+  if (D1) return (await ownerAccount()) ? "claimed" : "open";
+  if (process.env.LAZYPATH_PASSWORD) return "env";
+  if (PUBLIC) return "needsdb";
+  return loadConfig().accountCreated ? "claimed" : "open";
+}
+
+async function verifyLogin(user: string, password: string): Promise<boolean> {
+  if (!user || !password) return false;
+  if (D1) {
+    const owner = await ownerAccount();
+    return !!owner && sameSecret(user, owner.username) && checkPassword(password, owner.hash);
+  }
+  const cfg = loadConfig();
+  return sameSecret(user, cfg.user) && sameSecret(password, cfg.password);
+}
 
 function sameSecret(a: string, b: string): boolean {
   if (!a || !b) return false;
@@ -4114,25 +4212,498 @@ function sameSecret(a: string, b: string): boolean {
 }
 
 /** Stateless on purpose: an instance that never saw the sign-in still has to verify the
- *  cookie, and because the password is the HMAC key, changing it drops every session. */
-const sessionToken = (cfg: Config) => createHmac("sha256", cfg.password).update(`lazypath.session.${cfg.user}`).digest("hex");
+ *  cookie. With D1 the key is derived from the API token (stable across cold starts);
+ *  locally it is the password, so changing it drops every session. */
+function sessionSecret(): string {
+  return D1 ? createHash("sha256").update(`lazypath.d1.${CF_DB}.${CF_TOKEN}`).digest("hex") : loadConfig().password;
+}
+
+function sessionToken(user: string): string {
+  return createHmac("sha256", sessionSecret()).update(`lazypath.session.${user}`).digest("hex");
+}
+
+function sessionCookie(user: string): string {
+  return `lp_session=${user}.${sessionToken(user)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${SERVERLESS ? "; Secure" : ""}`;
+}
 
 /** The password doubles as the bearer token so OpenAI SDKs keep working with apiKey set
- *  to it; Basic is there for curl -u and anything else that speaks it natively. */
-function credentialed(req: IncomingMessage): boolean {
-  const cfg = loadConfig();
+ *  to it; Basic is there for curl -u and anything else that speaks it natively. With D1
+ *  the password is hashed, so bearer auth scrypt-checks it against the owner's row. */
+async function credentialed(req: IncomingMessage): Promise<boolean> {
   const header = req.headers.authorization ?? "";
   if (header.startsWith("Basic ")) {
     const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
     const cut = decoded.indexOf(":");
-    return cut > 0 && sameSecret(decoded.slice(0, cut), cfg.user) && sameSecret(decoded.slice(cut + 1), cfg.password);
+    return cut > 0 && (await verifyLogin(decoded.slice(0, cut), decoded.slice(cut + 1)));
   }
-  if (header.startsWith("Bearer ")) return sameSecret(header.slice(7), cfg.password);
-  return sameSecret(cookieValue(req.headers.cookie ?? "", "lp_session"), sessionToken(cfg));
+  if (header.startsWith("Bearer ")) {
+    const token = header.slice(7);
+    if (!token) return false;
+    if (D1) {
+      const owner = await ownerAccount();
+      return !!owner && checkPassword(token, owner.hash);
+    }
+    return sameSecret(token, loadConfig().password);
+  }
+  const raw = cookieValue(req.headers.cookie ?? "", "lp_session");
+  const cut = raw.lastIndexOf(".");
+  if (cut <= 0) return false;
+  const user = raw.slice(0, cut);
+  if (!D1 && !sameSecret(user, loadConfig().user)) return false;
+  return sameSecret(raw.slice(cut + 1), sessionToken(user));
 }
 
-function authed(req: IncomingMessage): boolean {
-  return !PUBLIC || credentialed(req);
+async function authed(req: IncomingMessage): Promise<boolean> {
+  return !PUBLIC || (await credentialed(req));
+}
+
+// --------------------------------------------------------------------------- public pages
+
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+const LP_LOGO = `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect width="24" height="24" rx="6" fill="#0b0f16" stroke="#232c3d"/><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#35d0ba" stroke-width="1.8" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg>`;
+
+const PAGE_CSS = String.raw`
+:root{--bg:#05070b;--bg2:#0a111c;--card:#0b0f16;--card2:#0e1420;--line:#232c3d;--line2:#31405a;
+--text:#e6edf3;--dim:#8b98a9;--acc:#35d0ba;--acc2:#4cc9f0;--amber:#ffb454;--rose:#f472b6;
+--ok:#34d399;--warn:#fbbf24;--err:#f87171;--deep:#2f6f63;
+--mono:ui-monospace,"Cascadia Code",Consolas,"SF Mono",monospace;--sans:system-ui,"Segoe UI",sans-serif}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 var(--sans);overflow-x:hidden}
+::selection{background:rgba(53,208,186,.32)}
+::-webkit-scrollbar{width:11px;height:11px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:var(--deep)}
+a{color:var(--acc2);text-decoration:none}
+.sky{position:fixed;inset:0;z-index:-2;background:
+radial-gradient(1100px 700px at 12% -8%,rgba(47,111,99,.34),transparent 62%),
+radial-gradient(900px 640px at 88% 12%,rgba(76,201,240,.14),transparent 60%),
+radial-gradient(1000px 800px at 50% 118%,rgba(255,180,84,.10),transparent 62%),
+linear-gradient(180deg,var(--bg) 0%,var(--bg2) 52%,var(--bg) 100%)}
+.aurora{position:fixed;inset:-20%;z-index:-1;pointer-events:none;filter:blur(90px);opacity:.5;
+background:radial-gradient(38% 30% at 24% 30%,rgba(53,208,186,.20),transparent 70%),
+radial-gradient(30% 26% at 76% 22%,rgba(76,201,240,.16),transparent 70%),
+radial-gradient(34% 30% at 62% 82%,rgba(244,114,182,.09),transparent 70%);
+animation:drift 26s ease-in-out infinite alternate}
+@keyframes drift{from{transform:translate3d(-2%,-1%,0) scale(1)}to{transform:translate3d(2%,2%,0) scale(1.07)}}
+.grain{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.05;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E")}
+header#nav{position:fixed;top:0;left:0;right:0;z-index:20;display:flex;align-items:center;gap:22px;
+padding:13px 26px;transition:background .25s,border-color .25s,box-shadow .25s;border-bottom:1px solid transparent}
+header#nav.scrolled{background:rgba(5,7,11,.82);backdrop-filter:blur(14px);border-bottom-color:var(--line);box-shadow:0 10px 34px rgba(0,0,0,.4)}
+.brand{display:flex;align-items:center;gap:9px;font:700 17px var(--mono);color:var(--text);letter-spacing:-.4px}
+.brand svg{width:27px;height:27px}
+.brand b{color:var(--acc);font-weight:700}
+.links{display:flex;gap:20px;margin-left:8px}
+.links a{color:var(--dim);font-size:13.5px;transition:color .15s}
+.links a:hover{color:var(--text)}
+.navbtns{margin-left:auto;display:flex;gap:9px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;font:600 13.5px var(--sans);
+padding:9px 17px;border-radius:9px;border:1px solid var(--line2);color:var(--text);background:transparent;
+cursor:pointer;transition:transform .15s,box-shadow .2s,background .2s,border-color .2s}
+.btn:hover{transform:translateY(-1px);border-color:var(--acc)}
+.btn:active{transform:translateY(0)}
+.btn.solid{background:linear-gradient(135deg,var(--deep),#28957f);border-color:#3aa88f;color:#fff;box-shadow:0 4px 18px rgba(53,208,186,.22)}
+.btn.solid:hover{box-shadow:0 8px 26px rgba(53,208,186,.36);border-color:var(--acc)}
+.btn.big{font-size:15px;padding:13px 24px;border-radius:11px}
+main{position:relative;z-index:1;max-width:1120px;margin:0 auto;padding:0 26px}
+section{scroll-margin-top:84px}
+.hero{display:grid;grid-template-columns:1.08fr .92fr;gap:44px;align-items:center;padding:138px 0 54px}
+.eyebrow{font:600 11.5px var(--mono);letter-spacing:2.4px;color:var(--acc);text-transform:uppercase;margin-bottom:18px;display:flex;align-items:center;gap:10px}
+.eyebrow::before{content:"";width:26px;height:1px;background:linear-gradient(90deg,var(--acc),transparent)}
+h1.head{font:700 clamp(34px,4.6vw,54px)/1.12 var(--mono);letter-spacing:-1.6px;margin:0 0 20px}
+h1.head em{font-style:normal;background:linear-gradient(94deg,var(--acc) 8%,var(--acc2) 52%,var(--amber) 96%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{color:var(--dim);font-size:16px;max-width:52ch;margin:0 0 28px}
+.lede b{color:var(--text);font-weight:600}
+.ctas{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.fallback{font:12.5px var(--mono);color:var(--dim)}
+.fallback b{color:var(--acc);font-weight:600}
+.route{position:relative;aspect-ratio:1/1;max-width:430px;margin:0 auto;width:100%}
+.route svg.wires{position:absolute;inset:0;width:100%;height:100%}
+.wires path{fill:none;stroke:url(#wiregrad);stroke-width:1.4;stroke-dasharray:3 7;stroke-linecap:round;animation:flow 1.6s linear infinite}
+@keyframes flow{to{stroke-dashoffset:-10}}
+.rtile{position:absolute;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:6px;transition:transform .2s}
+.rtile:hover{transform:translate(-50%,-50%) scale(1.09)}
+.rtmark{width:46px;height:46px;border-radius:12px;background:#000;border:1px solid var(--line);display:grid;place-items:center;box-shadow:0 6px 20px rgba(0,0,0,.5)}
+.rtmark svg,.rtmark img{width:26px;height:26px}
+.rtname{font:600 10.5px var(--mono);color:var(--dim);letter-spacing:.4px}
+.rhub{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:7px}
+.rhub .core{width:74px;height:74px;border-radius:19px;background:var(--card);border:1px solid var(--line2);display:grid;place-items:center;position:relative;box-shadow:0 0 0 6px rgba(53,208,186,.06),0 0 44px rgba(53,208,186,.22)}
+.rhub .core svg{width:44px;height:44px}
+.rhub .core::after{content:"";position:absolute;inset:-9px;border-radius:24px;border:1px solid rgba(53,208,186,.4);animation:pulse 2.6s ease-out infinite}
+@keyframes pulse{0%{transform:scale(.92);opacity:.9}100%{transform:scale(1.22);opacity:0}}
+.rhub .rtname{color:var(--acc)}
+.term{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.45);margin:8px 0 26px}
+.termbar{display:flex;gap:7px;padding:11px 15px;border-bottom:1px solid var(--line);background:var(--card2)}
+.termbar i{width:11px;height:11px;border-radius:50%}
+.termbar i:nth-child(1){background:#ff5f57}.termbar i:nth-child(2){background:#febc2e}.termbar i:nth-child(3){background:#28c840}
+.termbar span{margin-left:8px;font:11.5px var(--mono);color:var(--dim)}
+.term pre{margin:0;padding:18px 20px;font:12.8px/1.75 var(--mono);color:#c7d3e0;overflow-x:auto}
+.term .p{color:var(--acc)}.term .c{color:var(--dim)}.term .h{color:var(--amber)}.term .ok{color:var(--ok)}
+.caret{display:inline-block;width:8px;height:14px;background:var(--acc);vertical-align:-2px;animation:blink 1.1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.mqsec{padding:26px 0 8px}
+.mqlabel{text-align:center;font:600 11.5px var(--mono);letter-spacing:2.2px;color:var(--dim);text-transform:uppercase;margin-bottom:18px}
+.mq{overflow:hidden;mask-image:linear-gradient(90deg,transparent,#000 9%,#000 91%,transparent);padding:5px 0}
+.mqtrack{display:flex;gap:13px;width:max-content;animation:mq 46s linear infinite}
+.mq.rev .mqtrack{animation-direction:reverse;animation-duration:54s}
+.mq:hover .mqtrack{animation-play-state:paused}
+@keyframes mq{to{transform:translateX(-50%)}}
+.mqitem{display:flex;align-items:center;gap:9px;padding:8px 15px 8px 9px;border:1px solid var(--line);border-radius:11px;background:rgba(11,15,22,.72);font:600 12.5px var(--mono);color:var(--dim);white-space:nowrap;transition:border-color .2s,color .2s}
+.mqitem:hover{border-color:var(--deep);color:var(--text)}
+.mqt{width:30px;height:30px;border-radius:8px;background:#000;display:grid;place-items:center;flex:none}
+.mqt svg,.mqt img{width:18px;height:18px}
+h2.sec{font:700 clamp(23px,2.6vw,31px)/1.2 var(--mono);letter-spacing:-.8px;margin:0 0 8px}
+.seclede{color:var(--dim);margin:0 0 30px;max-width:64ch}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:64px 0 10px}
+.step{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:15px;padding:24px 22px;position:relative;overflow:hidden;transition:border-color .2s,transform .2s}
+.step:hover{border-color:var(--line2);transform:translateY(-3px)}
+.step .num{font:700 13px var(--mono);color:var(--acc);letter-spacing:1.6px;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.step .num svg{width:19px;height:19px;stroke:var(--acc2)}
+.step h3{font:600 16.5px var(--sans);margin:0 0 9px}
+.step p{margin:0;color:var(--dim);font-size:13.8px}
+.step p code{font:12px var(--mono);color:var(--amber);background:rgba(255,180,84,.08);padding:1px 5px;border-radius:5px}
+.step::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--acc),var(--acc2),transparent);opacity:.65}
+.presets{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:64px 0 12px}
+.preset{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:22px;transition:border-color .2s,transform .2s}
+.preset:hover{border-color:var(--deep);transform:translateY(-3px)}
+.preset h3{font:700 19px var(--mono);margin:0 0 4px;letter-spacing:-.4px}
+.preset.smart h3{color:var(--acc)}.preset.fast h3{color:var(--acc2)}.preset.cheap h3{color:var(--amber)}
+.preset p{color:var(--dim);font-size:13.3px;margin:0 0 16px;min-height:62px}
+.chain{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+.chain .cid{display:inline-flex;align-items:center;gap:6px;font:600 11.5px var(--mono);color:var(--text);background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:4px 9px 4px 5px}
+.chain .cid i{width:20px;height:20px;border-radius:5px;background:#000;display:grid;place-items:center;font-style:normal}
+.chain .cid svg,.chain .cid img{width:13px;height:13px}
+.chain .arr{color:var(--dim);font-size:12px}
+.stats{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;padding:52px 0 8px}
+.stat{border:1px solid var(--line);border-radius:13px;background:rgba(11,15,22,.7);padding:16px 26px;text-align:center;min-width:148px}
+.stat b{display:block;font:700 27px var(--mono);letter-spacing:-1px;background:linear-gradient(94deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.stat span{font:600 11px var(--mono);letter-spacing:1.6px;color:var(--dim);text-transform:uppercase}
+footer{position:relative;z-index:1;border-top:1px solid var(--line);margin-top:64px;padding:30px 26px 40px}
+.fwrap{max-width:1120px;margin:0 auto;display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between}
+.fnote{color:var(--dim);font-size:12.5px;max-width:64ch}
+.fnote a{color:var(--acc)}
+.rv{opacity:0;transform:translateY(22px);transition:opacity .7s ease,transform .7s ease;transition-delay:var(--d,0s)}
+.rv.in{opacity:1;transform:none}
+.authwrap{position:relative;z-index:1;min-height:100vh;display:grid;place-items:center;padding:44px 18px}
+.authcard{width:100%;max-width:410px;background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:18px;padding:32px 30px 26px;box-shadow:0 30px 80px rgba(0,0,0,.55);animation:rise .55s cubic-bezier(.2,.7,.3,1) both}
+@keyframes rise{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+.authbrand{display:flex;align-items:center;gap:9px;font:700 16px var(--mono);color:var(--text);margin-bottom:22px}
+.authbrand svg{width:26px;height:26px}
+.authbrand b{color:var(--acc)}
+.authcard h1{font:700 24px var(--mono);letter-spacing:-.7px;margin:0 0 7px}
+.authsub{color:var(--dim);font-size:13.5px;margin:0 0 20px}
+.banner{border-radius:10px;padding:11px 13px;font-size:13px;margin-bottom:16px;border:1px solid}
+.banner.err{background:rgba(248,113,113,.09);border-color:rgba(248,113,113,.4);color:#fca5a5}
+.banner.ok{background:rgba(52,211,153,.09);border-color:rgba(52,211,153,.4);color:#6ee7b7}
+.banner.info{background:rgba(251,191,36,.07);border-color:rgba(251,191,36,.35);color:#fcd34d}
+.field{margin-bottom:15px}
+.field label{display:block;font:600 11.5px var(--mono);letter-spacing:1.2px;text-transform:uppercase;color:var(--dim);margin-bottom:7px}
+.inwrap{position:relative}
+.field input{width:100%;font:14px var(--mono);background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:11px 13px;outline:none;transition:border-color .15s,box-shadow .15s}
+.field input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(53,208,186,.16)}
+.field input::placeholder{color:#4d5a6e}
+.peek{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:transparent;border:0;color:var(--dim);cursor:pointer;padding:6px;border-radius:7px;display:grid;place-items:center}
+.peek:hover{color:var(--acc)}
+.peek svg{width:17px;height:17px}
+.hint{font-size:11.8px;color:var(--dim);margin-top:6px}
+.hint.bad{color:var(--err)}
+.hint.good{color:var(--ok)}
+.meter{display:flex;gap:5px;margin-top:8px}
+.meter i{height:4px;flex:1;border-radius:3px;background:var(--line);transition:background .25s}
+.submit{width:100%;margin-top:6px;font:600 14.5px var(--sans);padding:12px;border-radius:11px;border:1px solid #3aa88f;color:#fff;background:linear-gradient(135deg,var(--deep),#28957f);cursor:pointer;transition:transform .15s,box-shadow .2s;box-shadow:0 4px 18px rgba(53,208,186,.2);display:flex;align-items:center;justify-content:center;gap:9px}
+.submit:hover{transform:translateY(-1px);box-shadow:0 8px 26px rgba(53,208,186,.34)}
+.submit:active{transform:translateY(0)}
+.submit:disabled{opacity:.7;cursor:wait;transform:none}
+.spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;display:none}
+.submit.loading .spin{display:block}
+@keyframes sp{to{transform:rotate(360deg)}}
+.alt{text-align:center;color:var(--dim);font-size:13px;margin:18px 0 0}
+.back{display:block;text-align:center;color:var(--dim);font-size:12.5px;margin-top:14px;transition:color .15s}
+.back:hover{color:var(--acc)}
+.lockicon{width:52px;height:52px;border-radius:14px;background:rgba(53,208,186,.1);border:1px solid rgba(53,208,186,.35);display:grid;place-items:center;margin-bottom:18px}
+.lockicon svg{width:25px;height:25px;stroke:var(--acc)}
+.envblock{font:12px/1.9 var(--mono);background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px 14px;color:var(--amber);margin:0 0 18px;overflow-x:auto;white-space:pre}
+@media (max-width:900px){
+.hero{grid-template-columns:1fr;padding-top:112px;gap:30px}
+.route{max-width:330px}
+.steps,.presets{grid-template-columns:1fr}
+.preset p{min-height:0}
+.links{display:none}
+h1.head{letter-spacing:-1px}
+}
+@media (max-width:480px){
+header#nav{padding:11px 14px;gap:10px}
+.navbtns{gap:6px}
+.navbtns .btn{padding:8px 11px;font-size:13px}
+.brand span{font-size:15px}
+.authwrap{padding:28px 14px}
+.authcard{padding:26px 20px 22px}
+}
+@media (prefers-reduced-motion:reduce){
+*,*::before,*::after{animation-duration:.001s !important;animation-iteration-count:1 !important;transition-duration:.001s !important}
+html{scroll-behavior:auto}
+.rv{opacity:1;transform:none}
+}
+`;
+
+function pageShell(title: string, body: string, script: string) {
+  return String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${title}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="lazypath - one OpenAI-compatible endpoint for every AI account you already have. Single file, zero dependencies.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%230b0f16'/%3E%3Cpath d='M5 16.5c4 0 3-9 7-9s3 9 7 9' stroke='%2335d0ba' stroke-width='1.8' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='5' cy='16.5' r='1.9' fill='%234cc9f0'/%3E%3Ccircle cx='19' cy='16.5' r='1.9' fill='%23ffb454'/%3E%3C/svg%3E">
+<style>${PAGE_CSS}</style></head><body>
+<div class="sky"></div><div class="aurora"></div><div class="grain"></div>
+${body}
+<script>${script}</script>
+</body></html>`;
+}
+
+const HOME_SCRIPT = String.raw`
+var nav=document.getElementById("nav");
+addEventListener("scroll",function(){nav.classList.toggle("scrolled",scrollY>14)},{passive:true});
+nav.classList.toggle("scrolled",scrollY>14);
+if("IntersectionObserver" in window){
+  var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add("in");io.unobserve(e.target)}})},{threshold:.12});
+  document.querySelectorAll(".rv").forEach(function(el){io.observe(el)});
+}else{document.querySelectorAll(".rv").forEach(function(el){el.classList.add("in")})}
+`;
+
+function mqRow(ids: string[], rev: boolean): string {
+  const items = ids
+    .map((id) => providerById(id))
+    .filter((p): p is ProviderDef => !!p && !!p.logo)
+    .map((p) => `<span class="mqitem"><span class="mqt">${p.logo}</span>${esc(p.label)}</span>`)
+    .join("");
+  return `<div class="mq${rev ? " rev" : ""}"><div class="mqtrack">${items}${items}</div></div>`;
+}
+
+function homePage(): string {
+  const nodes: [string, number, number, string, string][] = [
+    ["kimi", 72, 84, "M210 210 Q150 120 72 84", "Kimi"],
+    ["copilot", 348, 72, "M210 210 Q290 120 348 72", "Copilot"],
+    ["qwen", 40, 238, "M210 210 Q110 235 40 238", "Qwen"],
+    ["anthropic", 382, 246, "M210 210 Q300 235 382 246", "Claude"],
+    ["google-ai-studio", 116, 362, "M210 210 Q150 300 116 362", "Gemini"],
+    ["groq", 322, 366, "M210 210 Q270 300 322 366", "Groq"],
+  ];
+  const wires = nodes
+    .map(([, , , path], i) => {
+      const dur = (2.6 + i * 0.45).toFixed(2);
+      const back = i % 2 === 1 ? ` keyPoints="1;0" keyTimes="0;1" calcMode="linear"` : "";
+      return `<path d="${path}"/><circle r="3" fill="${i % 2 ? "#ffb454" : "#35d0ba"}"><animateMotion dur="${dur}s" begin="${(i * 0.4).toFixed(1)}s" repeatCount="indefinite" path="${path}"${back}/></circle>`;
+    })
+    .join("");
+  const tiles = nodes
+    .map(([id, x, y, , name]) => {
+      const p = providerById(id);
+      return `<div class="rtile" style="left:${((x / 420) * 100).toFixed(2)}%;top:${((y / 420) * 100).toFixed(2)}%"><span class="rtmark">${p?.logo ?? ""}</span><span class="rtname">${esc(name)}</span></div>`;
+    })
+    .join("");
+  const presetCopy: Record<string, string> = {
+    smart: "The best answer available. Strongest models first, and the chain keeps going when one fails.",
+    fast: "Low latency first. Small, quick models take the request before the heavy ones do.",
+    cheap: "Free and keyless tiers first, paid quota last. Stretch the accounts you already have.",
+  };
+  const presetCards = (Object.keys(DEFAULT_PRESETS) as (keyof Presets)[])
+    .map((name) => {
+      const chain = DEFAULT_PRESETS[name]
+        .map((id, i) => {
+          const p = providerById(id);
+          return `${i ? '<span class="arr">→</span>' : ""}<span class="cid"><i>${p?.logo ?? ""}</i>${esc(id)}</span>`;
+        })
+        .join("");
+      return `<div class="preset ${name} rv" style="--d:.${Object.keys(DEFAULT_PRESETS).indexOf(name)}s"><h3>${name}</h3><p>${presetCopy[name]}</p><div class="chain">${chain}</div></div>`;
+    })
+    .join("");
+  const body = String.raw`
+<header id="nav">
+  <a class="brand" href="/">${LP_LOGO}<span>lazy<b>path</b></span></a>
+  <nav class="links"><a href="#providers">Providers</a><a href="#how">How it works</a><a href="#presets">Presets</a></nav>
+  <div class="navbtns"><a class="btn" href="/signin">Sign in</a><a class="btn solid" href="/signup">Sign up</a></div>
+</header>
+<main>
+  <section class="hero">
+    <div>
+      <div class="eyebrow rv">Single file · Zero deps · OpenAI-compatible</div>
+      <h1 class="head rv" style="--d:.06s">Every AI you already use.<br><em>One lazy path in.</em></h1>
+      <p class="lede rv" style="--d:.12s">lazypath turns the AI accounts you already have — <b>Claude, Kimi, Copilot, Qwen</b> and ${PROVIDERS.length - 4} more — into one OpenAI-compatible endpoint. Claim your gateway with a username and password, connect your providers, and point any app at <b>/v1</b>.</p>
+      <div class="ctas rv" style="--d:.18s"><a class="btn solid big" href="/signup">Create your account</a><a class="btn big" href="/signin">Sign in</a></div>
+      <div class="fallback rv" style="--d:.24s">model: <b>"smart"</b> → kimi → minimax → copilot → qwen <span style="color:#4d5a6e">· automatic fallback</span></div>
+    </div>
+    <div class="route rv" style="--d:.2s" aria-hidden="true">
+      <svg class="wires" viewBox="0 0 420 420"><defs><linearGradient id="wiregrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#35d0ba"/><stop offset="1" stop-color="#4cc9f0"/></linearGradient></defs>${wires}</svg>
+      ${tiles}
+      <div class="rhub"><span class="core">${LP_LOGO}</span><span class="rtname">lazypath</span></div>
+    </div>
+  </section>
+  <div class="term rv">
+    <div class="termbar"><i></i><i></i><i></i><span>any app that speaks OpenAI</span></div>
+    <pre><span class="p">$</span> curl http://localhost:8787/v1/chat/completions \
+    <span class="h">-H "Authorization: Bearer yourpassword"</span> \
+    -d '{"model":"smart","messages":[{"role":"user","content":"hi"}]}'
+
+<span class="ok">← 200 OK</span>  <span class="c">x-lazypath-provider: kimi · fell back from minimax (429)</span> <span class="caret"></span></pre>
+  </div>
+  <section class="mqsec" id="providers">
+    <div class="mqlabel rv">${PROVIDERS.length} providers · device logins · browser sessions · platform keys</div>
+    ${mqRow(["kimi", "copilot", "anthropic", "google-ai-studio", "qwen", "grok", "minimax", "deepseek", "mistral", "groq", "cerebras"], false)}
+    ${mqRow(["huggingchat", "openrouter", "together", "nvidia-nim", "sambanova", "deepinfra", "novita", "modelscope", "zai-web", "perplexity-web", "pollinations", "zenmux-free"], true)}
+  </section>
+  <section id="how">
+    <div class="steps">
+      <div class="step rv"><div class="num"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round"><circle cx="10" cy="8" r="3.4"/><path d="M3.5 20c.8-3.6 3.4-5.4 6.5-5.4s5.7 1.8 6.5 5.4M18.5 6.5v5M16 9h5"/></svg>01 · CLAIM</div><h3>Claim your gateway</h3><p>Sign up once. The first account is the owner — the <b>only</b> account. On Vercel it lives in your Cloudflare D1 database, so it survives every cold start.</p></div>
+      <div class="step rv" style="--d:.1s"><div class="num"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round"><path d="M9 7V4M15 7V4M7 7h10v4a5 5 0 01-10 0V7zM12 16v4"/></svg>02 · CONNECT</div><h3>Connect your accounts</h3><p>Device-code logins for the CLIs you already use, browser sessions for the web apps, platform keys where that is the honest option. Tokens stay on your disk.</p></div>
+      <div class="step rv" style="--d:.2s"><div class="num"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M7 9.5l3 2.5-3 2.5M12.5 15H17"/></svg>03 · POINT</div><h3>Point any app at /v1</h3><p>One base URL, your password as the API key. Presets <code>smart</code> <code>fast</code> <code>cheap</code> pick a provider and fall down the chain when one fails.</p></div>
+    </div>
+  </section>
+  <section id="presets">
+    <div class="presets">
+      <div style="grid-column:1/-1"><h2 class="sec rv">Three model names are all you need</h2><p class="seclede rv">Presets are ordered chains of the providers you connected. A 429, a timeout or a dead token just moves the request to the next one — your app never sees the failure.</p></div>
+      ${presetCards}
+    </div>
+  </section>
+  <div class="stats">
+    <div class="stat rv"><b>${PROVIDERS.length}</b><span>providers</span></div>
+    <div class="stat rv" style="--d:.06s"><b>3</b><span>presets</span></div>
+    <div class="stat rv" style="--d:.12s"><b>1</b><span>file</span></div>
+    <div class="stat rv" style="--d:.18s"><b>0</b><span>dependencies</span></div>
+  </div>
+</main>
+<footer>
+  <div class="fwrap">
+    <a class="brand" href="/">${LP_LOGO}<span>lazy<b>path</b></span></a>
+    <div class="fnote">Loopback by default — your tokens never leave your machine. Provider logins use each service's own public flows; use them on your own accounts. <a href="https://github.com/pika68267-cloud/Lazypath">GitHub</a> · Node 24+ runs the single TypeScript file directly.</div>
+  </div>
+</footer>`;
+  return pageShell("lazypath — one lazy path to every AI", body, HOME_SCRIPT);
+}
+
+const AUTH_SCRIPT = String.raw`
+document.querySelectorAll(".peek").forEach(function(b){
+  b.addEventListener("click",function(){
+    var i=document.getElementById(b.getAttribute("data-for"));
+    var show=i.type==="password";i.type=show?"text":"password";
+    b.setAttribute("aria-label",show?"Hide password":"Show password");
+    b.innerHTML=show?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 3l18 18M10.6 10.7a2 2 0 002.8 2.8M9.4 5.2A9.5 9.5 0 0112 5c5 0 8.6 4.5 9.5 7-.4 1-1.2 2.3-2.4 3.5M6.2 6.3C4 7.8 2.7 9.9 2.5 12c.9 2.5 4.5 7 9.5 7 1.5 0 2.9-.4 4.1-1"/></svg>':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+  });
+});
+var pw=document.getElementById("pw"),meter=document.getElementById("meter"),mlabel=document.getElementById("mlabel");
+if(pw&&meter){
+  pw.addEventListener("input",function(){
+    var v=pw.value,s=0;
+    if(v.length>=8)s++;if(v.length>=12)s++;
+    if(/[a-z]/.test(v)&&/[A-Z]/.test(v))s++;
+    if(/\d/.test(v))s++;if(/[^A-Za-z0-9]/.test(v))s++;
+    var lvl=v.length===0?0:Math.max(1,Math.min(4,Math.ceil(s*4/5)));
+    var cols=["","#f87171","#fbbf24","#4cc9f0","#34d399"];
+    var words=["","weak","fair","good","strong"];
+    for(var k=0;k<4;k++){meter.children[k].style.background=k<lvl?cols[lvl]:"var(--line)"}
+    mlabel.textContent=v.length===0?"":words[lvl];
+    mlabel.className="hint "+(lvl>=3?"good":lvl>0?"bad":"");
+    checkConfirm();
+  });
+}
+var cf=document.getElementById("cf"),cfh=document.getElementById("cfhint");
+function checkConfirm(){
+  if(!cf||!pw)return;
+  if(cf.value.length===0){cfh.textContent="";cfh.className="hint";return}
+  var ok=cf.value===pw.value;
+  cfh.textContent=ok?"passwords match":"passwords do not match yet";
+  cfh.className="hint "+(ok?"good":"bad");
+}
+if(cf)cf.addEventListener("input",checkConfirm);
+var un=document.getElementById("un"),unh=document.getElementById("unhint");
+if(un)un.addEventListener("input",function(){
+  var ok=/^[A-Za-z0-9_-]{3,32}$/.test(un.value);
+  if(un.value.length===0){unh.textContent="";unh.className="hint";return}
+  unh.textContent=ok?"looks good":"3-32 characters: letters, digits, - or _";
+  unh.className="hint "+(ok?"good":"bad");
+});
+document.querySelectorAll("form.auth").forEach(function(f){
+  f.addEventListener("submit",function(e){
+    if(pw&&cf&&pw.value!==cf.value){e.preventDefault();checkConfirm();cf.focus();return}
+    if(un&&!/^[A-Za-z0-9_-]{3,32}$/.test(un.value)){e.preventDefault();un.focus();return}
+    var b=f.querySelector(".submit");b.classList.add("loading");b.disabled=true;
+  });
+});
+`;
+
+const PEEK_BTN = (id: string) =>
+  `<button type="button" class="peek" data-for="${id}" aria-label="Show password"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z"/><circle cx="12" cy="12" r="3"/></svg></button>`;
+
+const NO_PASSWORD_SET = "No LAZYPATH_PASSWORD is set on this deployment, so there is nothing to sign in with. Add it in the project's environment variables and redeploy — or set the CLOUDFLARE_* variables to enable sign-up with a database.";
+
+function signinPage(err: string, welcome: boolean, noPassword: boolean): string {
+  const body = String.raw`
+<div class="authwrap"><div class="authcard">
+  <a class="authbrand" href="/">${LP_LOGO}<span>lazy<b>path</b></span></a>
+  <h1>Welcome back</h1>
+  <p class="authsub">Sign in to open your gateway dashboard.</p>
+  ${welcome ? '<div class="banner ok">Account created. Sign in with the password you just chose.</div>' : ""}
+  ${noPassword ? `<div class="banner info">${NO_PASSWORD_SET}</div>` : ""}
+  ${err ? `<div class="banner err">${esc(err)}</div>` : ""}
+  <form class="auth" method="post" action="/signin">
+    <div class="field"><label for="un">Username</label><input id="un" name="user" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="your username" required autofocus></div>
+    <div class="field"><label for="pw">Password</label><div class="inwrap"><input id="pw" name="password" type="password" autocomplete="current-password" placeholder="your password" required>${PEEK_BTN("pw")}</div></div>
+    <button class="submit"><span class="spin"></span>Sign in</button>
+  </form>
+  <p class="alt">First time here? <a href="/signup">Claim this gateway</a></p>
+  <a class="back" href="/">← Back to home</a>
+</div></div>`;
+  return pageShell("Sign in · lazypath", body, AUTH_SCRIPT);
+}
+
+function signupPage(state: SignupState, err: string): string {
+  let inner: string;
+  if (state === "open") {
+    inner = String.raw`
+  <h1>Claim your gateway</h1>
+  <p class="authsub">One gateway, one owner. The first account created is the only account — after that, sign-up closes for good.</p>
+  ${err ? `<div class="banner err">${esc(err)}</div>` : ""}
+  <form class="auth" method="post" action="/signup">
+    <div class="field"><label for="un">Username</label><input id="un" name="user" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="pick a username" required autofocus><div class="hint" id="unhint"></div></div>
+    <div class="field"><label for="pw">Password</label><div class="inwrap"><input id="pw" name="password" type="password" autocomplete="new-password" placeholder="at least 8 characters" required minlength="8">${PEEK_BTN("pw")}</div><div class="meter" id="meter"><i></i><i></i><i></i><i></i></div><div class="hint" id="mlabel"></div></div>
+    <div class="field"><label for="cf">Confirm password</label><div class="inwrap"><input id="cf" name="confirm" type="password" autocomplete="new-password" placeholder="type it again" required>${PEEK_BTN("cf")}</div><div class="hint" id="cfhint"></div></div>
+    <button class="submit"><span class="spin"></span>Create account</button>
+  </form>
+  <p class="alt">Already the owner? <a href="/signin">Sign in</a></p>`;
+  } else if (state === "claimed") {
+    inner = String.raw`
+  <div class="lockicon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 018 0v3M12 14.5v2.5"/></svg></div>
+  <h1>Already claimed</h1>
+  <p class="authsub">This gateway has an owner, and one owner is all it takes. Sign-up is closed — strangers cannot register and spend the owner's connected providers.</p>
+  ${err ? `<div class="banner err">${esc(err)}</div>` : ""}
+  <a class="btn solid big" style="width:100%" href="/signin">Sign in instead</a>`;
+  } else if (state === "env") {
+    inner = String.raw`
+  <div class="lockicon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="18.5" cy="17" r="2.5"/></svg></div>
+  <h1>Login is set by env</h1>
+  <p class="authsub">This deployment signs in with the <b>LAZYPATH_USER</b> and <b>LAZYPATH_PASSWORD</b> environment variables, so there is nothing to sign up for. Use those credentials on the sign-in page.</p>
+  <a class="btn solid big" style="width:100%" href="/signin">Sign in</a>`;
+  } else {
+    inner = String.raw`
+  <div class="lockicon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round"><ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v13c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8v-13M4.5 12c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8"/></svg></div>
+  <h1>Sign-up needs a database</h1>
+  <p class="authsub">Serverless has no durable disk, so an account created here would vanish at the next cold start. Point lazypath at a Cloudflare D1 database and sign-up opens:</p>
+  <div class="envblock">CLOUDFLARE_ACCOUNT_ID=...
+CLOUDFLARE_D1_DATABASE_ID=...
+CLOUDFLARE_API_TOKEN=...</div>
+  <p class="authsub">Or set <b>LAZYPATH_PASSWORD</b> for a fixed login with no sign-up at all.</p>
+  ${err ? `<div class="banner err">${esc(err)}</div>` : ""}
+  <a class="btn solid big" style="width:100%" href="/signin">Sign in</a>`;
+  }
+  const body = String.raw`
+<div class="authwrap"><div class="authcard">
+  <a class="authbrand" href="/">${LP_LOGO}<span>lazy<b>path</b></span></a>
+  ${inner}
+  <a class="back" href="/">← Back to home</a>
+</div></div>`;
+  return pageShell("Sign up · lazypath", body, AUTH_SCRIPT);
 }
 
 async function readBody(req: IncomingMessage) {
@@ -4161,32 +4732,74 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     return res.end();
   }
   try {
-    if (url.pathname === "/" && (req.method === "GET" || req.method === "POST")) {
-      if (req.method === "POST") {
-        // POST, not GET: a password in the query string lands in request logs and history.
-        const form = new URLSearchParams(await readBody(req));
-        const cfg = loadConfig();
-        if (sameSecret(form.get("user") ?? "", cfg.user) && sameSecret(form.get("password") ?? "", cfg.password)) {
-          res.writeHead(302, {
-            location: "/",
-            "set-cookie": `lp_session=${sessionToken(cfg)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${SERVERLESS ? "; Secure" : ""}`,
-          });
-          return res.end();
-        }
-        res.writeHead(401, { "content-type": "text/html" });
-        return res.end(gatePage("Wrong username or password."));
-      }
-      if (authed(req)) {
-        res.writeHead(200, { "content-type": "text/html" });
-        return res.end(HTML);
-      }
-      res.writeHead(200, { "content-type": "text/html" });
-      return res.end(gatePage(SERVERLESS && !process.env.LAZYPATH_PASSWORD ? NO_PASSWORD_SET : ""));
+    if (url.pathname === "/" && req.method === "GET") {
+      if (await authed(req)) return html(res, 200, HTML);
+      return html(res, 200, homePage());
     }
-    if (!authed(req) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models")) {
+    if ((url.pathname === "/signin" || url.pathname === "/") && req.method === "POST") {
+      // POST, not GET: a password in the query string lands in request logs and history.
+      const form = new URLSearchParams(await readBody(req));
+      const user = form.get("user") ?? "";
+      let ok = false;
+      let err = "";
+      try {
+        ok = await verifyLogin(user, form.get("password") ?? "");
+      } catch (e) {
+        err = String(e);
+      }
+      if (ok) {
+        res.writeHead(302, { location: "/", "set-cookie": sessionCookie(user) });
+        return res.end();
+      }
+      return html(res, err ? 502 : 401, signinPage(err || "Wrong username or password.", false, false));
+    }
+    if (url.pathname === "/signin" && req.method === "GET") {
+      return html(res, 200, signinPage("", url.searchParams.get("welcome") === "1", SERVERLESS && !D1 && !process.env.LAZYPATH_PASSWORD));
+    }
+    if (url.pathname === "/signup" && (req.method === "GET" || req.method === "POST")) {
+      let state: SignupState;
+      try {
+        state = await signupState();
+      } catch (e) {
+        return html(res, 502, signupPage("needsdb", String(e)));
+      }
+      if (req.method === "GET") return html(res, 200, signupPage(state, ""));
+      if (state !== "open") return html(res, 409, signupPage(state, ""));
+      const form = new URLSearchParams(await readBody(req));
+      const user = (form.get("user") ?? "").trim();
+      const pw = form.get("password") ?? "";
+      const invalid = !/^[A-Za-z0-9_-]{3,32}$/.test(user)
+        ? "Username must be 3-32 characters: letters, digits, - or _."
+        : pw.length < 8
+          ? "Password needs at least 8 characters."
+          : pw !== (form.get("confirm") ?? "")
+            ? "Passwords do not match."
+            : "";
+      if (invalid) return html(res, 400, signupPage("open", invalid));
+      try {
+        if (D1) {
+          if (!(await claimAccount(user, pw))) return html(res, 409, signupPage("claimed", ""));
+        } else {
+          const cfg = loadConfig();
+          cfg.user = user;
+          cfg.password = pw;
+          cfg.accountCreated = true;
+          saveConfig(cfg);
+        }
+      } catch (e) {
+        return html(res, 502, signupPage("open", String(e)));
+      }
+      res.writeHead(302, { location: "/signin?welcome=1" });
+      return res.end();
+    }
+    if (url.pathname === "/signout" && req.method === "POST") {
+      res.writeHead(302, { location: "/", "set-cookie": "lp_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" });
+      return res.end();
+    }
+    if (!(await authed(req)) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models")) {
       return json(res, 401, { error: { message: "bad lazypath login" } });
     }
-    if (url.pathname === "/api/summary") return json(res, 200, summary(base));
+    if (url.pathname === "/api/summary") return json(res, 200, await summary(base));
 
     if (req.method === "POST" && url.pathname.startsWith("/api/")) {
       const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
@@ -4259,6 +4872,9 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 200, { ok: true });
       }
       if (url.pathname === "/api/rotate") {
+        if (D1) {
+          return json(res, 400, { error: { message: "your password is stored hashed in Cloudflare D1 - it was chosen at sign-up and cannot be rotated from here" } });
+        }
         // A rotated password would not survive the next cold start, and every app calling
         // this gateway is configured with the env one - rotating here would just break them.
         if (SERVERLESS) {
@@ -4281,7 +4897,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     }
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-      if (!credentialed(req)) {
+      if (!(await credentialed(req))) {
         return json(res, 401, { error: { message: "bad lazypath login" } });
       }
       const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
@@ -4388,9 +5004,16 @@ if (!SERVERLESS) {
   /** a second `lazypath` on the same port should not die with a stack trace */
   const alreadyUp = async (): Promise<boolean> => {
     const probeHost = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
+    const headers: Record<string, string> = {};
+    if (D1) {
+      const owner = await ownerAccount().catch(() => null);
+      if (owner) headers.cookie = `lp_session=${owner.username}.${sessionToken(owner.username)}`;
+    } else {
+      headers.authorization = `Bearer ${loadConfig().password}`;
+    }
     try {
       const r = await fetch(`http://${probeHost}:${PORT}/api/summary`, {
-        headers: { authorization: `Bearer ${loadConfig().password}` },
+        headers,
         signal: AbortSignal.timeout(1500),
       });
       return r.ok;
@@ -4414,11 +5037,16 @@ if (!SERVERLESS) {
       if (OPEN) openBrowser(dashboard);
       process.exit(0);
     }
-    server.listen(PORT, HOST, () => {
+    server.listen(PORT, HOST, async () => {
       console.log(`\n  lazypath v${VERSION} up on http://${HOST}:${PORT}`);
       console.log(`  dashboard  ${dashboard}`);
       console.log(`  openai api http://localhost:${PORT}/v1   (model: smart | fast | cheap)`);
-      console.log(`  login      ${loadConfig().user} / ${loadConfig().password}`);
+      if (D1) {
+        const owner = await ownerAccount().catch(() => null);
+        console.log(owner ? `  login      ${owner.username} / your sign-up password (Cloudflare D1)` : `  account    none yet - sign up at ${dashboard}signup`);
+      } else {
+        console.log(`  login      ${loadConfig().user} / ${loadConfig().password}`);
+      }
       console.log(`  data       ${DATA_DIR}\n`);
       console.log(`  ctrl-c to stop\n`);
       if (OPEN) openBrowser(dashboard);

@@ -70,7 +70,7 @@ function call(method, path, { body, headers = {}, form } = {}) {
 
 const bearer = { authorization: `Bearer ${PASSWORD}` };
 const basic = { authorization: "Basic " + Buffer.from(`${USER}:${PASSWORD}`).toString("base64") };
-const signIn = (user, password) => call("POST", "/", { form: new URLSearchParams({ user, password }).toString(), headers: { "content-type": "application/x-www-form-urlencoded" } });
+const signIn = (user, password, path = "/signin") => call("POST", path, { form: new URLSearchParams({ user, password }).toString(), headers: { "content-type": "application/x-www-form-urlencoded" } });
 const get = (path, headers) => call("GET", path, { headers });
 const post = (path, body, headers) => call("POST", path, { body, headers });
 const summary = async (headers) => (await get("/api/summary", headers)).json();
@@ -99,16 +99,26 @@ try {
 
   // ---- nothing is readable without signing in --------------------------------
   const gate = await get("/");
-  check("dashboard is gated off loopback", gate.status === 200 && gate.text().includes("Sign in to open the dashboard"));
-  check("the gate is a username + password form", gate.text().includes('name="user"') && gate.text().includes('name="password"') && gate.text().includes('method="post"'));
-  check("wrong password is rejected at the gate", (await signIn(USER, "nope")).status === 401);
-  check("wrong username is rejected at the gate", (await signIn("someone-else", PASSWORD)).status === 401);
-  check("a password in the query string does not sign in", (await get(`/?password=${PASSWORD}`)).text().includes("Sign in to open the dashboard"));
+  check("unauthenticated root is the public home page", gate.status === 200 && gate.text().includes('href="/signup"') && gate.text().includes('href="/signin"') && !gate.text().includes('id="groups"'));
+  const form = await get("/signin");
+  check("the sign-in page is a username + password form", form.text().includes('name="user"') && form.text().includes('name="password"') && form.text().includes('method="post"') && form.text().includes('action="/signin"'));
+  check("wrong password is rejected at sign-in", (await signIn(USER, "nope")).status === 401);
+  check("wrong username is rejected at sign-in", (await signIn("someone-else", PASSWORD)).status === 401);
+  check("the old POST / sign-in alias still works", (await signIn(USER, PASSWORD, "/")).status === 302);
+  check("a password in the query string does not sign in", (await get(`/?password=${PASSWORD}`)).text().includes('href="/signin"'));
   check("summary needs a login", (await get("/api/summary")).status === 401);
   check("model list needs a login", (await get("/v1/models")).status === 401);
   check("chat needs a login", (await post("/v1/chat/completions", { model: "smart", messages: [] })).status === 401);
   check("connect needs a login", (await post("/api/connect", { provider: "groq" })).status === 401);
   check("disconnect needs a login", (await post("/api/disconnect", { provider: "okmock" })).status === 401);
+
+  // ---- env-managed deployments do not offer sign-up ---------------------------
+  const signupGet = await get("/signup");
+  check("sign-up explains env-managed login", signupGet.status === 200 && signupGet.text().includes("Login is set by env") && signupGet.text().includes("LAZYPATH_PASSWORD"));
+  check("sign-up POST is refused when env-managed", (await call("POST", "/signup", { form: "user=stranger&password=longenough1&confirm=longenough1", headers: { "content-type": "application/x-www-form-urlencoded" } })).status === 409);
+  check("the welcome note shows after sign-up", (await get("/signin?welcome=1")).text().includes("Account created"));
+  const out = await post("/signout", {});
+  check("sign-out clears the cookie", out.status === 302 && (out.headers["set-cookie"] ?? "").includes("Max-Age=0"));
 
   // ---- signing in issues a signed cookie, not the password -------------------
   const login = await signIn(USER, PASSWORD);
@@ -117,12 +127,15 @@ try {
   check("correct credentials redirect to the dashboard", login.status === 302 && login.headers.location === "/");
   check("session cookie is HttpOnly, SameSite and Secure", cookie.includes("HttpOnly") && cookie.includes("SameSite=Lax") && cookie.includes("Secure"));
   check("the cookie does not carry the password", session.length > 0 && !cookie.includes(PASSWORD));
-  check("a forged session cookie is refused", (await get("/", { cookie: "lp_session=deadbeef" })).text().includes("Sign in to open the dashboard"));
+  check("the cookie names the user and a signature", session.startsWith(USER + ".") && session.split(".").length === 2);
+  check("a forged session cookie is refused", (await get("/", { cookie: "lp_session=deadbeef" })).text().includes('href="/signin"'));
+  check("a forged cookie with a real username is refused", (await get("/api/summary", { cookie: `lp_session=${USER}.deadbeef` })).status === 401);
   const jar = { cookie: `lp_session=${session}` };
   const dash = await get("/", jar);
-  check("cookie opens the dashboard", dash.status === 200 && dash.text().includes("lazypath") && !dash.text().includes("Sign in to open the dashboard"));
+  check("cookie opens the dashboard", dash.status === 200 && dash.text().includes('id="groups"'));
   const viaCookie = await summary(jar);
   check("cookie authenticates the api", viaCookie.serverless === true);
+  check("summary reports the account mode and public flag", viaCookie.accountMode === "local" && viaCookie.public === true);
   check("base url is https on serverless", viaCookie.baseUrl === `https://${HOSTHEADER}`, viaCookie.baseUrl);
   check("bearer password authenticates the api", (await summary(bearer)).serverless === true);
   check("http basic authenticates the api", (await summary(basic)).serverless === true);

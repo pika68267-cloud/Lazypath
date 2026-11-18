@@ -101,7 +101,7 @@ for (let i = 0; i < 60; i++) {
 
 try {
   const gate = await call("GET", "/");
-  check("built function serves the sign-in gate", gate.status === 200 && gate.text().includes("Sign in to open the dashboard"), gate.text().slice(0, 90));
+  check("built function serves the public home page", gate.status === 200 && gate.text().includes('href="/signup"') && gate.text().includes('href="/signin"'), gate.text().slice(0, 90));
   check("built function rejects a keyless api call", (await call("GET", "/api/summary")).status === 401);
   const summary = (await call("GET", "/api/summary", { headers: bearer })).json();
   check("built function reports serverless mode", summary.serverless === true);
@@ -159,14 +159,14 @@ for (const [name, envValue, diskValue] of hostile) {
   rmSync(home, { recursive: true, force: true });
 }
 
-// An unset password on serverless is a lockout, so the gate has to say so instead of
-// asking for a random secret that is regenerated on every cold start and never shown.
+// An unset password on serverless is a lockout, so the sign-in page has to say so instead
+// of asking for a random secret that is regenerated on every cold start and never shown.
 const noPwHome = mkdtempSync(join(tmpdir(), "lazypath-nopw-"));
-const noPassword = spawnSync(process.execPath, ["--input-type=module", "-e", probe.replace('req.url = "/api/summary"', 'req.url = "/"').replace("console.log(res.status)", "console.log(Buffer.concat(res.parts).toString())")], {
+const noPassword = spawnSync(process.execPath, ["--input-type=module", "-e", probe.replace('req.url = "/api/summary"', 'req.url = "/signin"').replace("console.log(res.status)", "console.log(Buffer.concat(res.parts).toString())")], {
   encoding: "utf8",
   env: { ...process.env, VERCEL: "1", LAZYPATH_HOME: noPwHome, LAZYPATH_PASSWORD: "", LAZYPATH_NO_OPEN: "1", LAZYPATH_MOCKS: "" },
 });
-check("an unset password is explained at the gate", noPassword.status === 0 && noPassword.stdout.includes("No LAZYPATH_PASSWORD is set"), (noPassword.stderr || "").trim().split("\n").slice(-2).join(" ").slice(0, 160));
+check("an unset password is explained at sign-in", noPassword.status === 0 && noPassword.stdout.includes("No LAZYPATH_PASSWORD is set"), (noPassword.stderr || "").trim().split("\n").slice(-2).join(" ").slice(0, 160));
 rmSync(noPwHome, { recursive: true, force: true });
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall vercel-build checks passed");
