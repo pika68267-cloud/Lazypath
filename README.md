@@ -150,7 +150,7 @@ still one source file. Vercel picks the script up by itself.
 | `LAZYPATH_TOKENS` | the token store as JSON — this is what makes connections survive. Get it from `lazypath export` on your machine. |
 | `LAZYPATH_CONFIG` | optional: presets and the disabled list as JSON, same shape as `~/.lazypath/config.json`. |
 | `CLOUDFLARE_ACCOUNT_ID` | enables D1 accounts: your Cloudflare account id. |
-| `CLOUDFLARE_D1_DATABASE_ID` | the D1 database that holds the owner account. |
+| `CLOUDFLARE_D1_DATABASE_ID` | the D1 database that holds the owner account (`CLOUDFLARE_DATABASE_ID` also works). |
 | `CLOUDFLARE_API_TOKEN` | a Cloudflare API token with D1 write access to that database. |
 
 Pick a password you would be happy to see in an `Authorization` header, because that is where
@@ -166,7 +166,9 @@ Cloudflare's REST API (plain `fetch`, still zero dependencies). To turn it on:
    plenty — it stores one row).
 2. Create an API token with **Account > D1 > Edit** permission.
 3. Set `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID` and `CLOUDFLARE_API_TOKEN` in Vercel
-   and redeploy.
+   and redeploy. For local runs, put the same three `KEY=value` lines in a `.cloudflare.env`
+   file inside the gateway home (`~/.lazypath`, or `LAZYPATH_HOME` when set); real environment
+   variables always win over the file.
 
 The gateway creates the `accounts` table itself on first use. Open `/signup`, choose a username
 and password, and that single account is claimed atomically — a concurrent second sign-up loses
