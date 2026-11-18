@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFileSync, rmSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -78,6 +78,17 @@ async function main() {
   const key = cfg.password;
   const auth = { authorization: `Bearer ${key}` };
 
+  // A config from an older build can hold no password at all. Minting a fresh one on every
+  // call would make the dashboard publish one secret while the bearer check demanded the next.
+  const withPassword = readFileSync(join(TESTDIR, "config.json"), "utf8");
+  writeFileSync(join(TESTDIR, "config.json"), JSON.stringify({ ...cfg, password: undefined }));
+  const first = await (await fetch(GW + "/api/summary")).json();
+  const second = await (await fetch(GW + "/api/summary")).json();
+  const minted = await post("/v1/chat/completions", { model: "smart", messages: [{ role: "user", content: "hi" }] }, { authorization: `Bearer ${second.password}` });
+  check("a passwordless config mints a stable secret", !!first.password && first.password === second.password);
+  check("the minted secret authenticates a chat", minted.status === 200, `got ${minted.status}`);
+  writeFileSync(join(TESTDIR, "config.json"), withPassword);
+
   const badKey = await post("/v1/chat/completions", { model: "smart", messages: [] }, { authorization: "Bearer nope" });
   check("rejects wrong gateway password", badKey.status === 401);
 
@@ -90,6 +101,12 @@ async function main() {
   const noProviders = await post("/v1/chat/completions", { model: "smart", messages: [{ role: "user", content: "hi" }] }, auth);
   const noProvidersJson = await noProviders.json();
   check("nothing linked is answered by the keyless floor", noProviders.status === 200 && noProvidersJson.choices?.[0]?.message?.content === "hello from keyless mock");
+
+  // the keyless mock ignores stream:true and answers with a plain JSON object: a caller that
+  // asked for SSE still has to receive chunks, never a bare body it cannot parse
+  const keylessStream = await post("/v1/chat/completions", { model: "smart", messages: [{ role: "user", content: "hi" }], stream: true }, auth);
+  const keylessSse = await keylessStream.text();
+  check("a json-only provider is re-emitted as an sse stream", keylessStream.status === 200 && (keylessStream.headers.get("content-type") ?? "").includes("event-stream") && keylessSse.includes('"object":"chat.completion.chunk"') && keylessSse.includes("hello from keyless mock") && keylessSse.trimEnd().endsWith("data: [DONE]"), keylessSse.slice(0, 90));
 
   const unlinked = await post("/v1/chat/completions", { model: "failmock/whatever", messages: [{ role: "user", content: "hi" }] }, auth);
   check("a provider you never linked -> 502 with attempts", unlinked.status === 502 && Array.isArray((await unlinked.json()).error.attempts));

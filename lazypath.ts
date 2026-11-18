@@ -145,7 +145,15 @@ function loadConfig(): Config {
     // anything a warm instance happened to generate before the env vars were set.
     // `||` not `??`: an env var set to the empty string must not become an empty password.
     cfg.user = process.env.LAZYPATH_USER || cfg.user || "admin";
-    cfg.password = process.env.LAZYPATH_PASSWORD || cfg.password || randomBytes(16).toString("hex");
+    // A config written by an older build can have no password at all. Regenerating the
+    // fallback on every call would make /api/summary publish a secret that the very next
+    // bearer check rejects, so mint it once and put it on disk.
+    if (!cfg.password && !process.env.LAZYPATH_PASSWORD) {
+      cfg.password = randomBytes(16).toString("hex");
+      writeJson(CONFIG_FILE, cfg);
+    } else {
+      cfg.password = process.env.LAZYPATH_PASSWORD || cfg.password;
+    }
     return cfg;
   }
   const cfg: Config = {
@@ -1772,11 +1780,27 @@ function toAnthropicBody(body: Record<string, unknown>, model: string) {
   const system = messages.filter((m) => m.role === "system").map((m) => textOf(m.content)).join("\n");
   const chat = messages
     .filter((m) => m.role !== "system")
-    .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: textOf(m.content) }));
+    .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: typeof m.content === "string" ? m.content : anthropicContent(m.content) }));
   const out: Record<string, unknown> = { model, messages: chat, max_tokens: Number(body.max_tokens ?? 4096) };
   if (system) out.system = system;
   if (body.temperature !== undefined) out.temperature = body.temperature;
   if (body.stream) out.stream = true;
+  return out;
+}
+
+/** OpenAI image_url parts become anthropic image blocks; data URLs stay base64, http URLs become url sources. */
+function anthropicContent(content: unknown) {
+  const out: Record<string, unknown>[] = [];
+  for (const part of Array.isArray(content) ? content : [content]) {
+    const p = part as { type?: string; text?: string; image_url?: { url?: string } };
+    if (p?.type === "image_url" && p.image_url?.url) {
+      const m = /^data:([^;]+);base64,(.+)$/s.exec(p.image_url.url);
+      out.push(m ? { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } } : { type: "image", source: { type: "url", url: p.image_url.url } });
+    } else {
+      const t = typeof part === "string" ? part : p?.text ?? "";
+      if (t) out.push({ type: "text", text: t });
+    }
+  }
   return out;
 }
 
@@ -1849,12 +1873,25 @@ function toResponsesBody(body: Record<string, unknown>, model: string) {
     .map((m) => ({
       type: "message",
       role: m.role === "assistant" ? "assistant" : "user",
-      content: [{ type: "input_text", text: textOf(m.content) }],
+      content: typeof m.content === "string" ? [{ type: "input_text", text: m.content }] : responsesContent(m.content),
     }));
   const out: Record<string, unknown> = { model, input, stream: true };
   if (instructions) out.instructions = instructions;
   if (body.max_tokens !== undefined) out.max_output_tokens = body.max_tokens;
   if (body.temperature !== undefined) out.temperature = body.temperature;
+  return out;
+}
+
+function responsesContent(content: unknown) {
+  const out: Record<string, unknown>[] = [];
+  for (const part of Array.isArray(content) ? content : [content]) {
+    const p = part as { type?: string; text?: string; image_url?: { url?: string } };
+    if (p?.type === "image_url" && p.image_url?.url) out.push({ type: "input_image", image_url: p.image_url.url });
+    else {
+      const t = typeof part === "string" ? part : p?.text ?? "";
+      if (t) out.push({ type: "input_text", text: t });
+    }
+  }
   return out;
 }
 
@@ -3564,8 +3601,20 @@ interface Attempt {
   detail: string;
 }
 
-async function routeChat(model: string, body: Record<string, unknown>) {
+const VISION_WIRES = new Set(["openai", "anthropic", "responses"]);
+
+function bodyHasImages(body: Record<string, unknown>): boolean {
+  const ms = (body.messages ?? []) as { content: unknown }[];
+  return ms.some((m) => Array.isArray(m.content) && m.content.some((c) => (c as { type?: string })?.type === "image_url"));
+}
+
+async function prepareAttempts(model: string, body: Record<string, unknown>) {
   const attempts = await prepare(candidatesFor(model));
+  return bodyHasImages(body) ? attempts.filter((a) => VISION_WIRES.has(a.provider.inference.format)) : attempts;
+}
+
+async function routeChat(model: string, body: Record<string, unknown>) {
+  const attempts = await prepareAttempts(model, body);
   const tried: Attempt[] = [];
   const fail = (status: number) => ({
     status,
@@ -3574,7 +3623,10 @@ async function routeChat(model: string, body: Record<string, unknown>) {
     providerUsed: "none",
     modelUsed: model,
   });
-  if (attempts.length === 0) return fail(502);
+  if (attempts.length === 0) {
+    if (bodyHasImages(body)) tried.push({ provider: "none", detail: "images need a vision-capable provider - connect an API-key one (groq, openrouter, xai, ...)" });
+    return fail(502);
+  }
 
   for (const a of attempts) {
     let res: Response;
@@ -3650,8 +3702,9 @@ async function routeChat(model: string, body: Record<string, unknown>) {
 }
 
 async function routeChatStream(model: string, body: Record<string, unknown>) {
-  const attempts = await prepare(candidatesFor(model));
+  const attempts = await prepareAttempts(model, body);
   const tried: Attempt[] = [];
+  if (attempts.length === 0 && bodyHasImages(body)) tried.push({ provider: "none", detail: "images need a vision-capable provider - connect an API-key one (groq, openrouter, xai, ...)" });
   for (const a of attempts) {
     let res: Response;
     try {
@@ -3765,10 +3818,105 @@ const HTML = String.raw`<!doctype html>
   .close{margin-left:auto;background:transparent;border:0;color:var(--dim);font-size:20px;cursor:pointer;padding:0 6px}
   .mrow{display:flex;gap:8px;align-items:center;margin:12px 0}
   .msec{border-top:1px solid var(--line);margin-top:14px;padding-top:12px;font-size:12px;color:var(--dim)}
+  .shell{display:flex;min-height:100vh}
+  #side{width:212px;flex:none;background:var(--card);border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+  .sbrand{display:flex;align-items:center;gap:9px;padding:17px 16px 13px;font-size:16px;font-weight:600;letter-spacing:-.01em}
+  .sbrand svg{width:22px;height:22px;flex:none}
+  .sbrand b{color:var(--acc);font-weight:600}
+  .snav{display:flex;flex-direction:column;gap:2px;padding:4px 10px}
+  .mbtn{display:flex;align-items:center;gap:10px;background:transparent;color:var(--dim);border:0;border-radius:8px;padding:9px 11px;font:inherit;font-size:13.5px;cursor:pointer;text-align:left}
+  .mbtn:hover{background:var(--card2);color:var(--txt)}
+  .mbtn.sel{background:rgba(94,234,212,.1);color:var(--acc);font-weight:500}
+  .mbtn svg{width:15px;height:15px;flex:none}
+  .sfoot{margin-top:auto;padding:12px 16px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);display:flex;flex-direction:column;gap:9px}
+  .sfoot button{width:100%}
+  main#main{flex:1;min-width:0;max-width:none;padding:0;margin:0}
+  #panel-connect,#panel-api{max-width:1080px;margin:0 auto;padding:26px 18px 70px}
+  .chatwrap{display:flex;flex-direction:column;height:100vh;max-width:860px;margin:0 auto;width:100%}
+  .chatwrap[hidden]{display:none}
+  .chathead{display:flex;gap:9px;align-items:center;padding:11px 16px;border-bottom:1px solid var(--line)}
+  .modelsel{font:inherit;background:#05070b;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:7px 10px;flex:1;min-width:0;max-width:360px}
+  .msgs{flex:1;overflow-y:auto;padding:18px 16px 12px;display:flex;flex-direction:column;gap:13px}
+  .welcome{margin:auto;text-align:center;color:var(--dim);max-width:440px;padding:20px}
+  .welcome svg{width:42px;height:42px;margin-bottom:8px}
+  .welcome h3{margin:0 0 6px;color:var(--txt);font-size:16px;font-weight:600}
+  .sug{display:flex;flex-wrap:wrap;gap:7px;justify-content:center;margin-top:15px}
+  .sug button{background:var(--card);border:1px solid var(--line);color:var(--dim);border-radius:99px;padding:6px 12px;font-size:12px;font-weight:400}
+  .sug button:hover{border-color:var(--acc);color:var(--acc)}
+  .msg{display:flex;gap:10px;max-width:92%;align-self:flex-start}
+  .msg.user{align-self:flex-end;flex-direction:row-reverse}
+  .mav{width:26px;height:26px;border-radius:8px;flex:none;display:grid;place-items:center;background:var(--card2);border:1px solid var(--line);overflow:hidden}
+  .mav svg{width:15px;height:15px}
+  .mav img{width:26px;height:26px;object-fit:cover}
+  .bub{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 13px;font-size:14px;line-height:1.55;min-width:0;overflow-wrap:break-word}
+  .msg.user .bub{background:rgba(94,234,212,.09);border-color:#2f6f63}
+  .bub pre{margin:8px 0;padding:9px 11px}
+  .bub code{background:#05070b;border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px}
+  .bub pre code{border:0;padding:0;background:transparent}
+  .bub .thumbs{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}
+  .bub .thumbs img{width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line);display:block}
+  .mtag{font-size:10.5px;color:var(--dim);margin-top:6px;display:flex;align-items:center;gap:5px}
+  .mtag i{width:7px;height:7px;border-radius:50%;display:inline-block}
+  .caret{display:inline-block;width:7px;height:14px;background:var(--acc);vertical-align:-2px;margin-left:2px;animation:blink 1s steps(2) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .errbub{border-color:#5c2530;background:rgba(239,68,68,.07);color:#fca5a5}
+  .composer{border-top:1px solid var(--line);padding:10px 14px 12px}
+  .attach{display:flex;gap:8px;padding:0 2px 9px;flex-wrap:wrap}
+  .athumb{position:relative}
+  .athumb img{width:46px;height:46px;object-fit:cover;border-radius:8px;border:1px solid var(--line);display:block}
+  .athumb button{position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:var(--bad);color:#fff;font-size:12px;line-height:17px;padding:0;border:0;cursor:pointer}
+  .crow{display:flex;gap:8px;align-items:flex-end;border:1px solid var(--line);background:var(--card);border-radius:14px;padding:8px 9px}
+  .crow:focus-within{border-color:#2f6f63}
+  #cinput{border:0;background:transparent;padding:6px 4px;max-height:170px;min-height:20px;font:14px/1.5 system-ui,sans-serif;width:100%}
+  #cinput:focus{outline:none;border-color:transparent}
+  .iconbtn{width:34px;height:34px;border-radius:9px;background:transparent;border:1px solid var(--line);color:var(--dim);display:grid;place-items:center;cursor:pointer;padding:0;flex:none}
+  .iconbtn:hover{color:var(--txt);border-color:#3a4763}
+  .iconbtn svg{width:16px;height:16px}
+  .send{background:var(--acc);border-color:var(--acc);color:#06231f}
+  .send:disabled{opacity:.35;cursor:default}
+  .chint{font-size:11px;color:var(--dim);padding:7px 3px 0}
+  .apigrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-bottom:16px}
+  .kval{font:13px ui-monospace,Consolas,monospace;color:var(--acc);word-break:break-all;user-select:all;margin-top:7px}
+  .snip{position:relative}
+  .snip pre{max-height:300px;margin-top:0}
+  .snip .cpyb{position:absolute;top:9px;right:9px}
+  .tabs{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+  .tab{font-size:12px;border:1px solid var(--line);background:var(--card);border-radius:99px;padding:4px 12px;color:var(--dim);cursor:pointer}
+  .tab.sel{background:var(--acc);color:#06231f;border-color:var(--acc);font-weight:500}
+  @media (max-width:760px){
+    .shell{flex-direction:column}
+    #side{width:100%;height:auto;position:sticky;top:0;z-index:8;flex-direction:row;align-items:center;border-right:0;border-bottom:1px solid var(--line);padding:0 8px;gap:4px}
+    .sbrand{padding:9px 8px}
+    .sbrand span{display:none}
+    .snav{flex-direction:row;padding:6px 0;flex:1;overflow-x:auto}
+    .mbtn{padding:8px 10px;font-size:12.5px;white-space:nowrap}
+    .sfoot{margin-top:0;border-top:0;flex-direction:row;align-items:center;padding:0 6px;gap:8px;width:auto}
+    .sfoot #scount{display:none}
+    .sfoot button{width:auto;padding:6px 10px}
+    .chatwrap{height:calc(100dvh - 53px)}
+    #panel-connect,#panel-api{padding:16px 12px 60px}
+    .msg{max-width:97%}
+  }
+  @media (prefers-reduced-motion:reduce){.caret{animation:none;opacity:.6}}
 </style>
 </head>
 <body>
-<main>
+<div class="shell">
+<aside id="side">
+  <div class="sbrand"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect width="24" height="24" rx="6" fill="#0b0f16" stroke="#232c3d"/><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="1.8" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg><span>lazy<b>path</b></span></div>
+  <nav class="snav">
+    <button class="mbtn sel" id="m-connect" onclick="setMode('connect')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 7V3M15 7V3M8 10h8v4a4 4 0 0 1-8 0v-4zM12 18v3"/></svg>Connect</button>
+    <button class="mbtn" id="m-chat" onclick="setMode('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3c-1.3 0-2.6-.3-3.6-.9L4 20l1.2-4A8 8 0 1 1 21 11.5z"/></svg>Chat</button>
+    <button class="mbtn" id="m-api" onclick="setMode('api')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/></svg>API</button>
+  </nav>
+  <div class="sfoot">
+    <div id="scount"></div>
+    <button class="ghost" id="out" style="display:none" onclick="signOut()">Sign out</button>
+  </div>
+</aside>
+<main id="main">
+
+<section id="panel-connect">
   <h1>lazy<b>path</b></h1>
   <div class="sub">One endpoint for every model. Account logins, browser sessions and platform keys.</div>
   <div class="card" id="faas" style="display:none;margin-bottom:6px;border-color:#7c5a12"></div>
@@ -3777,7 +3925,6 @@ const HTML = String.raw`<!doctype html>
     <div class="grow"><div class="wait">Gateway login</div><code id="k"></code></div>
     <span class="kbd" id="cpy" onclick="copyKey()">copy</span>
     <button class="ghost" id="rot" onclick="act('rotate',{}).then(load)">rotate</button>
-    <button class="ghost" id="out" style="display:none" onclick="signOut()">sign out</button>
   </div>
 
   <h2>Usage</h2>
@@ -3796,10 +3943,51 @@ const HTML = String.raw`<!doctype html>
 
   <h2>Easy mode <span class="meta">- model names you can just use</span></h2>
   <div class="card" id="presets"></div>
+</section>
 
-  <h2>Try it</h2>
-  <div class="card"><pre id="curl"></pre></div>
+<section id="panel-chat" class="chatwrap" hidden>
+  <div class="chathead">
+    <select id="cmodel" class="modelsel" onchange="CHAT.model=this.value;localStorage.lp_model=this.value;paintHint()"></select>
+    <button class="ghost" onclick="newChat()">New chat</button>
+  </div>
+  <div class="msgs" id="cmsgs"></div>
+  <div class="composer">
+    <div class="attach" id="cattach" style="display:none"></div>
+    <div class="crow">
+      <button class="iconbtn" title="Attach images" onclick="document.getElementById('cfile').click()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 11-8.5 8.5a5 5 0 0 1-7-7L13 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-3-3L15 9"/></svg></button>
+      <input type="file" id="cfile" accept="image/*" multiple style="display:none" onchange="pickImgs(this)">
+      <textarea id="cinput" rows="1" placeholder="Message lazypath" oninput="grow(this)" onkeydown="keySend(event)"></textarea>
+      <button class="iconbtn send" id="csend" title="Send" onclick="sendChat()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button>
+      <button class="iconbtn" id="cstop" title="Stop" style="display:none" onclick="stopChat()"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
+    </div>
+    <div class="chint" id="chint"></div>
+  </div>
+</section>
+
+<section id="panel-api" hidden>
+  <h1>lazy<b>path</b> API</h1>
+  <div class="sub">Every OpenAI-compatible client, library and app can point at this gateway.</div>
+  <div class="apigrid">
+    <div class="card">
+      <div class="wait">Base URL</div>
+      <div class="kval" id="apibase"></div>
+      <div class="mrow"><button class="ghost" onclick="copyPre('apibase',this)">copy</button></div>
+    </div>
+    <div class="card">
+      <div class="wait">API key</div>
+      <div id="apkey"></div>
+    </div>
+  </div>
+  <h2>Try it <span class="meta">- paste into a terminal or your app</span></h2>
+  <div class="tabs" id="sniptabs"></div>
+  <div class="card snip"><pre id="snip"></pre><button class="ghost cpyb" onclick="copyPre('snip',this)">copy</button></div>
+  <h2>Models <span class="meta">- what you can put in the model field</span></h2>
+  <div class="card"><div class="wait" id="modelhint"></div><pre id="modellist" style="margin-top:8px"></pre></div>
+  <div class="mrow"><button onclick="testKey()">Test connection</button><span class="wait" id="tstat"></span></div>
+</section>
+
 </main>
+</div>
 
 <div class="scrim" id="scrim" onclick="if(event.target.id==='scrim')closeModal()">
   <div class="modal" id="modal"></div>
@@ -3870,7 +4058,8 @@ function render(){
   }
   if(S.accountMode==="cloudflare")document.getElementById("rot").style.display="none";
   S._max=Math.max(1,S.providers.reduce(function(a,p){return Math.max(a,p.usage.requests)},0));
-  document.getElementById("curl").textContent='curl '+S.baseUrl+'/v1/chat/completions \\\n  -H "Authorization: Bearer '+(S.password||"YOUR_PASSWORD")+'" \\\n  -H "content-type: application/json" \\\n  -d \'{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}\'';
+  document.getElementById("scount").textContent=S.providers.filter(function(p){return p.connected}).length+" of "+S.providers.length+" connected";
+  modelOpts();renderApi();paintHint();
   var groups={};
   S.providers.filter(visible).forEach(function(p){(groups[p.group]=groups[p.group]||[]).push(p)});
   var host=document.getElementById("groups");host.innerHTML="";
@@ -3977,7 +4166,236 @@ async function load(force){
   if(!force&&sig===load.last)return;   // unchanged: skip rebuild so modals stay put
   load.last=sig;render();
 }
-load();
+// ---------------------------------------------------------------- three modes: connect / chat / api
+var MODE=localStorage.getItem("lp_mode")||"connect";
+var CHAT={msgs:[],imgs:[],busy:false,ctl:null,model:localStorage.getItem("lp_model")||"smart"};
+var APIKEY=localStorage.getItem("lp_key")||"",APIVIS=false,SNIPTAB="curl";
+try{var _saved=JSON.parse(localStorage.getItem("lp_chat")||"null");if(_saved&&_saved.msgs&&_saved.msgs.length)CHAT.msgs=_saved.msgs}catch(e){}
+var LPMARK='<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="2" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg>';
+function setMode(m){
+  MODE=m;localStorage.lp_mode=m;
+  ["connect","chat","api"].forEach(function(x){
+    document.getElementById("m-"+x).className="mbtn"+(x===m?" sel":"");
+    var p=document.getElementById("panel-"+x);
+    if(x===m)p.removeAttribute("hidden");else p.setAttribute("hidden","");
+  });
+  if(m==="chat"){renderChat();var t=document.getElementById("cinput");if(t&&!CHAT.busy)t.focus()}
+  if(m==="api")renderApi(true);
+}
+function modelOpts(){
+  var sel=document.getElementById("cmodel");if(!S||!sel)return;
+  var h='<optgroup label="Easy mode"><option value="smart">smart - best first, falls back</option><option value="fast">fast</option><option value="cheap">cheap</option></optgroup>';
+  S.providers.filter(function(p){return p.connected&&!p.disabled}).forEach(function(p){
+    h+='<optgroup label="'+esc(p.label)+'">';
+    p.models.forEach(function(m){h+='<option value="'+esc(p.id+"/"+m.id)+'">'+esc(m.label||m.id)+"</option>"});
+    h+="</optgroup>";
+  });
+  if(modelOpts.sig!==h){
+    modelOpts.sig=h;
+    sel.innerHTML=h;
+    sel.value=CHAT.model;
+    if(sel.selectedIndex<0)sel.value="smart";
+    CHAT.model=sel.value;
+  }
+}
+function paintHint(){
+  var el=document.getElementById("chint");if(!el||!S)return;
+  var m=CHAT.model||"smart",p=null;
+  S.providers.forEach(function(x){if(m.indexOf(x.id+"/")===0)p=x});
+  var txt="";
+  if(p&&!p.vision)txt="This provider logs in through a web session that cannot carry images - attachments are skipped for it.";
+  else if(!p)txt="Attachments go to vision-capable providers; text-only web logins are skipped when a message has images.";
+  el.textContent=txt;
+}
+function provTag(id,model){
+  if(!S)return esc(id);
+  var p=null;S.providers.forEach(function(x){if(x.id===id)p=x});
+  return p?'<i style="background:'+p.color+'"></i>'+esc(p.label)+" · "+esc(model||CHAT.model||"smart"):esc(id);
+}
+function md(t){
+  var F=String.fromCharCode(96,96,96);
+  var parts=String(t||"").split(F),out="";
+  for(var i=0;i<parts.length;i++){
+    if(i%2)out+='<pre><code>'+esc(codeStrip(parts[i]))+"</code></pre>";
+    else out+=esc(parts[i]).replace(/\u0060([^\u0060\n]+)\u0060/g,"<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g,"<b>$1</b>").replace(/\n/g,"<br>");
+  }
+  return out;
+}
+function codeStrip(c){
+  c=c.replace(/^\n/,"").replace(/\n$/,"");
+  var nl=c.indexOf("\n"),first=nl<0?c:c.slice(0,nl);
+  if(nl>0&&first.length<15&&first.indexOf(" ")<0)return c.slice(nl+1);
+  return c;
+}
+function renderChat(){
+  var host=document.getElementById("cmsgs");if(!host)return;
+  if(!CHAT.msgs.length){
+    host.innerHTML='<div class="welcome">'+LPMARK+"<h3>Chat through every connected provider</h3><div class=\"wait\">Pick a model, attach images if you like. lazypath streams the answer and falls back when a provider stumbles.</div><div class=\"sug\">"+["What can you do right now?","Give me a haiku about gateways","Explain a diff in three bullets"].map(function(q){return '<button onclick="seed(this.textContent)">'+esc(q)+"</button>"}).join("")+"</div></div>";
+    return;
+  }
+  host.innerHTML=CHAT.msgs.map(function(m,i){
+    var last=i===CHAT.msgs.length-1;
+    if(m.role==="user"){
+      var imgs=(m.imgs||[]).map(function(u){return u.indexOf("data:")===0?'<img src="'+u.replace(/"/g,"&quot;")+'" alt="attached">':'<span class="wait">'+esc(u)+"</span>"}).join("");
+      return '<div class="msg user"><span class="mav"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span><div class="bub">'+(m.text?esc(m.text).replace(/\n/g,"<br>"):"")+(imgs?'<div class="thumbs">'+imgs+"</div>":"")+"</div></div>";
+    }
+    var tail=CHAT.busy&&last?'<span class="caret"></span>':"";
+    var tags=(m.error?'<div class="mtag" style="color:#fca5a5">'+esc(m.error)+"</div>":"")+(m.stopped?'<div class="mtag">(stopped)</div>':"")+(m.provider&&!m.error?'<div class="mtag">'+provTag(m.provider,m.model)+"</div>":"");
+    var inner=m.text?md(m.text)+tail:(m.error||m.stopped?"":'<span class="wait">'+(CHAT.busy&&last?"thinking…":"(empty answer)")+"</span>");
+    return '<div class="msg"><span class="mav">'+LPMARK+"</span><div class=\"bub"+(m.error?" errbub":"")+"\">"+inner+tags+"</div></div>";
+  }).join("");
+  host.scrollTop=host.scrollHeight;
+}
+function streamPaint(){
+  if(MODE!=="chat")return;
+  var host=document.getElementById("cmsgs"),last=host.lastElementChild;
+  var m=CHAT.msgs[CHAT.msgs.length-1];
+  if(!last||!m||!m.text)return;
+  var bub=last.querySelector(".bub");
+  if(bub){bub.innerHTML=md(m.text)+'<span class="caret"></span>';host.scrollTop=host.scrollHeight}
+}
+function seed(q){var t=document.getElementById("cinput");t.value=q;grow(t);t.focus()}
+function keySend(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat()}}
+function grow(t){t.style.height="auto";t.style.height=Math.min(t.scrollHeight,170)+"px"}
+function pickImgs(inp){
+  Array.prototype.forEach.call(inp.files,function(f){
+    if(!/^image\//.test(f.type))return;
+    if(f.size>6*1024*1024){alert(f.name+" is over 6 MB");return}
+    var fr=new FileReader();
+    fr.onload=function(){CHAT.imgs.push(fr.result);paintAttach()};
+    fr.readAsDataURL(f);
+  });
+  inp.value="";
+}
+function paintAttach(){
+  var a=document.getElementById("cattach");if(!a)return;
+  if(!CHAT.imgs.length){a.style.display="none";a.innerHTML="";return}
+  a.style.display="";
+  a.innerHTML=CHAT.imgs.map(function(u,i){return '<span class="athumb"><img src="'+u.replace(/"/g,"&quot;")+'" alt=""><button onclick="CHAT.imgs.splice('+i+',1);paintAttach()">×</button></span>'}).join("");
+}
+function newChat(){
+  if(CHAT.ctl)stopChat();
+  CHAT.msgs=[];CHAT.imgs=[];paintAttach();saveChat();renderChat();
+}
+function stopChat(){if(CHAT.ctl)CHAT.ctl.abort()}
+function updateComposer(){
+  document.getElementById("csend").style.display=CHAT.busy?"none":"";
+  document.getElementById("cstop").style.display=CHAT.busy?"":"none";
+  document.getElementById("csend").disabled=CHAT.busy;
+}
+function wireMsgs(){
+  return CHAT.msgs.map(function(m){
+    if(m.imgs&&m.imgs.length)return{role:m.role,content:m.imgs.map(function(u){return{type:"image_url",image_url:{url:u}}}).concat(m.text?[{type:"text",text:m.text}]:[])};
+    return{role:m.role,content:m.text};
+  });
+}
+function sendChat(){
+  if(CHAT.busy)return;
+  var ta=document.getElementById("cinput"),text=ta.value.trim();
+  if(!text&&!CHAT.imgs.length)return;
+  CHAT.msgs.push({role:"user",text:text,imgs:CHAT.imgs.slice()});
+  CHAT.imgs=[];paintAttach();ta.value="";grow(ta);
+  streamReply();
+}
+async function streamReply(){
+  var asst={role:"assistant",text:"",provider:"",model:CHAT.model||"smart"};
+  CHAT.msgs.push(asst);
+  CHAT.busy=true;updateComposer();renderChat();
+  var ctl=new AbortController();CHAT.ctl=ctl;
+  // loopback has no session cookie, so the dashboard authenticates with its own password;
+  // on a public host the HttpOnly cookie from sign-in rides along automatically
+  var hdrs={"content-type":"application/json"};
+  if(!S.public&&S.password)hdrs.authorization="Bearer "+S.password;
+  try{
+    var r=await fetch("/v1/chat/completions",{method:"POST",headers:hdrs,body:JSON.stringify({model:CHAT.model||"smart",messages:wireMsgs(),stream:true}),signal:ctl.signal});
+    asst.provider=r.headers.get("x-lazypath-provider")||"";
+    if(!r.ok){
+      var j=await r.json().catch(function(){return{}});
+      var e=j.error||{};
+      var det=(e.attempts||[]).map(function(a){return String(a.provider||"?")+(a.status?" "+a.status:"")+(a.detail?": "+String(a.detail).slice(0,160):"")});
+      asst.error=(e.message||("HTTP "+r.status))+(det.length?" ("+det.join("; ")+")":"");
+    }else{
+      var rd=r.body.getReader(),dec=new TextDecoder(),buf="";
+      for(;;){
+        var ch=await rd.read();if(ch.done)break;
+        buf+=dec.decode(ch.value,{stream:true});
+        var cut;
+        while((cut=buf.indexOf("\n\n"))>=0){
+          var frame=buf.slice(0,cut);buf=buf.slice(cut+2);
+          var lines=frame.split("\n");
+          for(var k=0;k<lines.length;k++){
+            var ln=lines[k];
+            if(ln.indexOf("data:")!==0)continue;
+            var pl=ln.slice(5).trim();
+            if(!pl||pl==="[DONE]")continue;
+            try{
+              var ev=JSON.parse(pl);
+              var dc=ev.choices&&ev.choices[0]&&ev.choices[0].delta&&ev.choices[0].delta.content;
+              if(dc){asst.text+=dc;streamPaint()}
+            }catch(err){}
+          }
+        }
+      }
+      load(true);
+    }
+  }catch(e){
+    if(e&&e.name==="AbortError"){asst.stopped=true}
+    else asst.error=String(e);
+  }
+  CHAT.busy=false;CHAT.ctl=null;
+  saveChat();updateComposer();renderChat();
+}
+function saveChat(){
+  try{localStorage.setItem("lp_chat",JSON.stringify({msgs:CHAT.msgs.slice(-40)}))}
+  catch(e){
+    try{localStorage.setItem("lp_chat",JSON.stringify({msgs:CHAT.msgs.slice(-40).map(function(m){return{role:m.role,text:m.text,provider:m.provider,model:m.model,error:m.error,stopped:m.stopped,imgs:m.imgs&&m.imgs.length?["(image dropped: storage full)"]:[]}})}))}catch(e2){}
+  }
+}
+function renderApi(force){
+  if(!S)return;
+  document.getElementById("apibase").textContent=S.baseUrl+"/v1";
+  var kc=document.getElementById("apkey");
+  var sig=(S.password||"")+String(APIVIS)+APIKEY;
+  if(!force&&kc._sig===sig){snips();return}
+  kc._sig=sig;
+  if(S.password){
+    kc.innerHTML='<div class="kval">'+(APIVIS?esc(S.password):"••••••••••••••••••")+'</div><div class="mrow"><button class="ghost" onclick="APIVIS=!APIVIS;renderApi(true)">'+(APIVIS?"hide":"reveal")+'</button><button class="ghost" onclick="copyKey2(this)">copy</button></div><div class="wait">Your gateway password - it also signs you in.</div>';
+  }else{
+    kc.innerHTML='<div class="wait">With a cloud account the gateway never stores or sees your password, so it cannot fill this in. Type it once - it stays in this browser:</div><div class="mrow"><input type="password" id="keyin" placeholder="the password you chose at sign-up" value="'+esc(APIKEY)+'" oninput="APIKEY=this.value;try{localStorage.lp_key=APIKEY}catch(e){};snips()"></div>';
+  }
+  snips();
+}
+function copyKey2(el){if(!S||!S.password)return;navigator.clipboard.writeText(S.password);el.textContent="copied";setTimeout(function(){el.textContent="copy"},1200)}
+function copyPre(id,el){navigator.clipboard.writeText(document.getElementById(id).textContent);el.textContent="copied";setTimeout(function(){el.textContent="copy"},1200)}
+var SNIPS=["curl","javascript","python","fetch"];
+function snips(){
+  if(!S)return;
+  var tabs=document.getElementById("sniptabs");
+  tabs.innerHTML=SNIPS.map(function(t){return '<span class="tab'+(SNIPTAB===t?" sel":"")+'" onclick="SNIPTAB=\''+t+'\';snips()">'+(t==="curl"?"curl":t==="javascript"?"JavaScript":t==="python"?"Python":"fetch")+"</span>"}).join("");
+  var base=S.baseUrl,key=(S.password||APIKEY)||"YOUR_PASSWORD";
+  var sig=SNIPTAB+base+key;
+  if(snips.sig===sig)return;
+  snips.sig=sig;
+  var txt;
+  if(SNIPTAB==="curl")txt='curl '+base+'/v1/chat/completions \\\n  -H "Authorization: Bearer '+key+'" \\\n  -H "content-type: application/json" \\\n  -d \'{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}\'';
+  else if(SNIPTAB==="javascript")txt='import OpenAI from "openai";\n\nconst client = new OpenAI({ baseURL: "'+base+'/v1", apiKey: "'+key+'" });\n\nconst stream = await client.chat.completions.create({\n  model: "smart",\n  messages: [{ role: "user", content: "hi" }],\n  stream: true,\n});\nfor await (const part of stream)\n  console.log(part.choices[0]?.delta?.content ?? "");';
+  else if(SNIPTAB==="python")txt='from openai import OpenAI\n\nclient = OpenAI(base_url="'+base+'/v1", api_key="'+key+'")\n\nstream = client.chat.completions.create(\n    model="smart",\n    messages=[{"role": "user", "content": "hi"}],\n    stream=True,\n)\nfor part in stream:\n    print(part.choices[0].delta.content or "", end="")';
+  else txt='const res = await fetch("'+base+'/v1/chat/completions", {\n  method: "POST",\n  headers: { authorization: "Bearer '+key+'",\n    "content-type": "application/json" },\n  body: JSON.stringify({ model: "smart",\n    messages: [{ role: "user", content: "hi" }], stream: true }),\n});\nfor await (const chunk of res.body) {\n  for (const line of new TextDecoder().decode(chunk).split("\\n")) {\n    if (!line.startsWith("data:")) continue;\n    const d = line.slice(5).trim();\n    if (d === "[DONE]") break;\n    console.log(JSON.parse(d).choices[0]?.delta?.content ?? "");\n  }\n}';
+  document.getElementById("snip").textContent=txt;
+  var conn=S.providers.filter(function(p){return p.connected&&!p.disabled});
+  document.getElementById("modelhint").textContent="smart / fast / cheap walk your connected chain; provider/model addresses one provider; a bare model id routes to any connected provider that serves it.";
+  document.getElementById("modellist").textContent=["smart","fast","cheap"].concat(conn.map(function(p){return p.models.map(function(m){return p.id+"/"+m.id})})).join("\n");
+}
+async function testKey(){
+  if(!S)return;
+  var key=S.password||APIKEY,st=document.getElementById("tstat");
+  if(!key){st.textContent="enter the sign-up password first";return}
+  st.textContent="testing...";
+  var r=await fetch(S.baseUrl+"/v1/models",{headers:{authorization:"Bearer "+key}});
+  var j=await r.json().catch(function(){return{}});
+  st.textContent=r.ok?((j.data||[]).length+" models reachable"):"failed: "+((j.error&&j.error.message)||("HTTP "+r.status));
+}
+load().then(function(){setMode(MODE)});
 setInterval(function(){load()},3000);
 </script>
 </body>
@@ -4014,6 +4432,7 @@ async function summary(base: string) {
         site: p.site,
         hint: p.hint,
         trust: p.trust,
+        vision: VISION_WIRES.has(p.inference.format),
         connected: !!t,
         disabled: cfg.disabled.includes(p.id),
         expiresAt: t?.expiresAt,
@@ -4984,6 +5403,25 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
           }
           if (buf.trim()) res.write(translate(buf, out.modelUsed ?? model));
           return res.end();
+        }
+        const upstreamType = out.response.headers.get("content-type") ?? "";
+        if (upstreamType.includes("application/json")) {
+          // Some providers ignore stream:true and answer with a plain JSON body. A caller that
+          // asked for SSE must still get SSE, so wrap the finished answer in the same chunks.
+          const text = await out.response.text();
+          let content = text;
+          try {
+            const parsed = JSON.parse(text) as { choices?: { message?: { content?: unknown } }[] };
+            const got = parsed.choices?.[0]?.message?.content;
+            content = typeof got === "string" ? got : text;
+          } catch {
+            /* not JSON after all: hand the bytes over unchanged */
+          }
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-lazypath-provider": out.providerUsed ?? "" });
+          res.write(chunk(out.modelUsed ?? model, { role: "assistant" }));
+          if (content) res.write(chunk(out.modelUsed ?? model, { content }));
+          res.write(chunk(out.modelUsed ?? model, {}, "stop"));
+          return res.end("data: [DONE]\n\n");
         }
         res.writeHead(200, {
           "content-type": out.response.headers.get("content-type") ?? "text/event-stream",

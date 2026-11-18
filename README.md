@@ -48,6 +48,22 @@ which is what `curl -u user:password` sends.
 
 ## Use it
 
+The dashboard's left rail has three modes, and the one you left it on comes back after a reload:
+
+- **Connect** — the provider grid, usage bars, presets and password rotation.
+- **Chat** — a ChatGPT-shaped conversation over your own providers: pick a preset or any
+  `provider/model`, attach images, watch the answer stream, stop it mid-reply, switch models
+  between turns. The transcript lives in that browser tab's `localStorage`, never on disk.
+- **API** — the base URL, your password as the key (masked until you reveal it) and snippets for
+  curl, the OpenAI SDK and plain `fetch`, with a **Test connection** button.
+
+Attachments only reach providers whose wire can carry them — an OpenAI `image_url` part, an
+Anthropic `source` block, or a Responses `input_image`. A text-only web login is skipped when your
+message has an image, and the picker marks which connected providers take images at all, so a
+preset never quietly drops your picture and hands you an answer about nothing.
+
+From any other app it is one endpoint and one credential:
+
 ```bash
 curl http://localhost:8787/v1/chat/completions \
   -H "Authorization: Bearer yourpassword" -H "content-type: application/json" \
@@ -123,7 +139,10 @@ Clients speak OpenAI. Providers that speak something else get translated both wa
 streaming: `anthropic` (Messages), `kiro` (AWS eventstream), `responses` (ChatGPT/Grok), plus the
 bespoke shapes of HuggingChat, Kimi web, Doubao, Z.ai web, Inner AI, Perplexity web, Claude web,
 ZenMux, Adapta (Clerk-minted session token) and Hyperagent (thread bootstrap).
-Tool calls and multimodal content are not translated yet — text-only today.
+Tool calls are not translated yet. Images are: `image_url` parts pass through to OpenAI-wire
+providers and are converted into Anthropic `source` blocks or Responses `input_image` items. A
+provider that ignores `stream:true` and answers with a plain JSON object gets re-emitted as an SSE
+stream, so a streaming client never has to parse a bare body.
 
 ## Deploy to Vercel
 
@@ -220,7 +239,7 @@ requests, so:
 ## Tests
 
 ```
-npm test          # 183 checks: every wire format, fallback, streaming, presets, usage, auth,
+npm test          # 186 checks: every wire format, fallback, streaming, presets, usage, auth,
                   # serverless mode, D1 accounts, then the artifact Vercel actually runs
 npm run typecheck
 ```
