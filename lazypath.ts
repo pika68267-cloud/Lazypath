@@ -4665,7 +4665,11 @@ async function d1Query(sql: string, params: (string | number)[] = []) {
       signal: AbortSignal.timeout(10000),
     });
   } catch (e) {
-    throw new Error(`Cloudflare D1 is unreachable: ${String(e)}`);
+    // undici's "fetch failed" hides the real reason in cause, and each one needs a different fix.
+    const why = (e as { cause?: { code?: string; message?: string } }).cause;
+    throw new Error(
+      `Cloudflare D1 is unreachable at ${CF_API}/accounts/${CF_ACCOUNT}: ${why?.code ?? why?.message ?? String(e)}`,
+    );
   }
   const j = (await r.json()) as {
     success?: boolean;
