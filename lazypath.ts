@@ -5620,8 +5620,23 @@ if (!SERVERLESS) {
       console.log(`  dashboard  ${dashboard}`);
       console.log(`  openai api http://localhost:${PORT}/v1   (model: smart | fast | cheap)`);
       if (D1) {
-        const owner = await ownerAccount().catch(() => null);
-        console.log(owner ? `  login      ${owner.username} / your sign-up password (Cloudflare D1)` : `  account    none yet - sign up at ${dashboard}signup`);
+        // "no account row yet" and "the database did not answer" look identical to the dashboard
+        // but need opposite fixes, so the boot line keeps them apart and shows where it looked.
+        let owner: AccountRow | null = null;
+        let d1boot = "";
+        try {
+          owner = await ownerAccount();
+        } catch (e) {
+          d1boot = String((e as Error).message);
+        }
+        console.log(
+          d1boot
+            ? `  account    the database did not answer: ${d1boot}`
+            : owner
+              ? `  login      ${owner.username} / your sign-up password (Cloudflare D1)`
+              : `  account    none yet - sign up at ${dashboard}signup`,
+        );
+        console.log(`  d1         ${CF_API} - database ${CF_DB}`);
       } else {
         console.log(`  login      ${loadConfig().user} / ${loadConfig().password}`);
       }
