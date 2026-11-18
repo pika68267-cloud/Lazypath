@@ -22,7 +22,9 @@ store as JSON — see [Deploy to Vercel](#deploy-to-vercel)). Running a second c
 the dashboard of the one that is already up.
 
 Single file, zero runtime dependencies, Node >= 24 (it runs the TypeScript directly).
-Config, tokens and usage live in `~/.lazypath/` — delete that folder to reset.
+Config, tokens and usage live in `~/.lazypath/` — delete that folder to reset. With a Cloudflare
+D1 database configured, the tokens live there instead, so resetting means clearing the `store`
+table.
 
 The dashboard is open on loopback because nothing else can reach it. Bind anywhere else
 (`--host 0.0.0.0`, or a Vercel deployment) and `/` becomes a **home page** with **Sign in** and
@@ -31,14 +33,15 @@ good — the first person to claim it owns it, and everyone after that sees "Alr
 Signing in sets an `HttpOnly` session cookie the dashboard then rides; the cookie holds a
 signature, not the password.
 
-Where the account lives depends on the deployment:
+Where the account and the connections live depends on the deployment:
 
 - **Local (loopback):** sign-up writes the username and password you chose into
   `~/.lazypath/config.json`, replacing the generated ones. No database needed.
-- **Cloudflare D1:** set the three `CLOUDFLARE_*` variables and the account is stored in a D1
-  database, so it survives serverless cold starts. The password is stored as a salted scrypt
+- **Cloudflare D1:** set the three `CLOUDFLARE_*` variables and both the account **and** every
+  linked provider live in a D1 database, so they survive serverless cold starts and a local
+  device-code login becomes usable by the deployment. The password is stored as a salted scrypt
   hash, never in plaintext, and is never served back by the API. See
-  [Accounts in the cloud](#accounts-in-the-cloud).
+  [Accounts and tokens in the cloud](#accounts-and-tokens-in-the-cloud).
 - **Env-managed:** set `LAZYPATH_PASSWORD` and sign-up is disabled — the credentials are whatever
   the environment says, which is the simplest path for a personal deployment.
 
@@ -166,37 +169,62 @@ still one source file. Vercel picks the script up by itself.
 | --- | --- |
 | `LAZYPATH_USER` | the sign-in username for env-managed mode. Defaults to `admin`. Ignored when D1 accounts are on. |
 | `LAZYPATH_PASSWORD` | the sign-in password and bearer token for env-managed mode. Set it **or** set the `CLOUDFLARE_*` variables below — with neither, a public deployment has no way to sign in and the sign-in page says so. |
-| `LAZYPATH_TOKENS` | the token store as JSON — this is what makes connections survive. Get it from `lazypath export` on your machine. |
+| `LAZYPATH_TOKENS` | the token store as JSON. Without D1 this **is** the store — get it from `lazypath export` on your machine. With D1 it only seeds the database the first time it runs. |
 | `LAZYPATH_CONFIG` | optional: presets and the disabled list as JSON, same shape as `~/.lazypath/config.json`. |
-| `CLOUDFLARE_ACCOUNT_ID` | enables D1 accounts: your Cloudflare account id. |
-| `CLOUDFLARE_D1_DATABASE_ID` | the D1 database that holds the owner account (`CLOUDFLARE_DATABASE_ID` also works). |
+| `CLOUDFLARE_ACCOUNT_ID` | enables D1 (the account **and** the token store): your Cloudflare account id. |
+| `CLOUDFLARE_D1_DATABASE_ID` | the D1 database that holds the owner account and every connected provider (`CLOUDFLARE_DATABASE_ID` also works). |
 | `CLOUDFLARE_API_TOKEN` | a Cloudflare API token with D1 write access to that database. |
 
 Pick a password you would be happy to see in an `Authorization` header, because that is where
 it ends up: `Bearer <password>` for OpenAI SDKs, or `curl -u "$LAZYPATH_USER:$LAZYPATH_PASSWORD"`.
 
-### Accounts in the cloud
+### Accounts and tokens in the cloud
 
-Serverless has no durable disk, so an account created on one cold start would vanish on the
-next. Cloudflare D1 fixes that: the owner account lives in a database the function reads over
-Cloudflare's REST API (plain `fetch`, still zero dependencies). To turn it on:
+Serverless has no durable disk, so an account created on one cold start would vanish on the next —
+and so would every provider you linked. Cloudflare D1 fixes both: the owner account and the token
+store live in one database the function reaches over Cloudflare's REST API (plain `fetch`, still
+zero dependencies). To turn it on:
 
 1. In the Cloudflare dashboard, **Workers & Pages > D1** and create a database (the free tier is
-   plenty — it stores one row).
+   plenty — it holds two small tables).
 2. Create an API token with **Account > D1 > Edit** permission.
 3. Set `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID` and `CLOUDFLARE_API_TOKEN` in Vercel
    and redeploy. For local runs, put the same three `KEY=value` lines in a `.cloudflare.env`
    file inside the gateway home (`~/.lazypath`, or `LAZYPATH_HOME` when set); real environment
    variables always win over the file.
 
-The gateway creates the `accounts` table itself on first use. Open `/signup`, choose a username
-and password, and that single account is claimed atomically — a concurrent second sign-up loses
-the race and gets "Already claimed". The password is stored as a salted **scrypt** hash; the API
-never returns it, and the dashboard shows "the password you chose at sign-up" instead of a value
-to copy. Sign-in checks the password against the hash, and the same password works as the bearer
-token. Because the hash is in D1, every cold start verifies the same account and the same session
-cookies. Rotating the password from the dashboard is refused in this mode — it was chosen at
-sign-up; to change it, update the row in D1.
+**The account.** The gateway creates the `accounts` table itself on first use. Open `/signup`,
+choose a username and password, and that single account is claimed atomically — a concurrent
+second sign-up loses the race and gets "Already claimed". The password is stored as a salted
+**scrypt** hash; the API never returns it, and the dashboard shows "the password you chose at
+sign-up" instead of a value to copy. Sign-in checks the password against the hash, and the same
+password works as the bearer token. Because the hash is in D1, every cold start verifies the same
+account and the same session cookies. Rotating the password from the dashboard is refused in this
+mode — it was chosen at sign-up; to change it, update the row in D1.
+
+**The token store.** A second table, `store`, keeps one JSON row per connected provider
+(`token:kimi`, `token:copilot`, …) plus a `meta:tokens` marker, and every API or chat request
+refreshes its view of it before anything reads a token. So:
+
+- a link completed on the deployed dashboard is written to D1 and simply survives the next cold
+  start — no export, no env var to paste;
+- a **device-code** login done in the local gateway, where a poller can stay alive, shows up on
+  the deployment as soon as it next reads the database. That is the whole reason for the table:
+  Copilot, Kimi, Kiro, Codex, Grok, Tencent and the two PKCE paste flows are refused on
+  serverless, so you link them once locally and both ends share the result;
+- disconnecting deletes the row, and the first hydration marked the database as in charge, so
+  `LAZYPATH_TOKENS` cannot resurrect a provider you just unlinked. Until that marker exists,
+  whatever this machine already has — the file, or the env seed — is copied in once.
+
+**Reads degrade, writes do not.** If Cloudflare is briefly unreachable, a request still answers
+from this instance's own copy instead of failing, and the database is retried at most every 15
+seconds (the dashboard polls every 3). A login that cannot be *saved* is reported as an error
+rather than silently dropped.
+
+**The tradeoff.** Those rows are your provider access and refresh tokens, now stored at a third
+party and read with a Cloudflare API token that grants write access to the whole database. Keep
+that token out of the repo, and if putting your tokens in Cloudflare is not acceptable to you,
+deploy without the `CLOUDFLARE_*` variables and carry connections in `LAZYPATH_TOKENS` instead.
 
 If a public deployment has neither D1 nor `LAZYPATH_PASSWORD`, sign-up shows a "needs a database"
 notice rather than a form, because there is nowhere durable to put the account.
@@ -215,20 +243,26 @@ in a URL, a request log or your history.
 **What serverless changes.** There is no durable disk and no process that stays alive between
 requests, so:
 
-- Connections you make on the deployed dashboard last only until the next cold start. Put them
-  in `LAZYPATH_TOKENS` to keep them. Usage bars reset the same way.
+- With D1 configured, connections made on the deployed dashboard are written to the database and
+  survive. Without it they last only until the next cold start — put them in `LAZYPATH_TOKENS` to
+  keep them. Usage bars reset either way; they are not in the database.
 - Device-code logins (Kimi, Copilot, Kiro, Codex, Grok, Tencent) and the two PKCE paste flows
-  (GitLab, Anthropic) are **refused** there — they need a poller or a verifier that outlives one
-  request. Link them locally instead:
+  (GitLab, Anthropic) are still **refused on the deployment** — they need a poller or a verifier
+  that outlives one request, which no amount of storage gives you. Link them in the local gateway
+  and, with D1, the deployment reads the same row:
 
   ```
-  lazypath            # connect the providers in the local dashboard
+  lazypath            # connect the providers in the local dashboard (same CLOUDFLARE_* values)
+  ```
+
+  Without D1, carry them over by hand instead:
+
+  ```
   lazypath export     # prints the token store JSON — paste it into LAZYPATH_TOKENS
   ```
 
   `export` prints live credentials. Treat its output like a password.
-- Platform keys and browser cookies paste fine on the deployed dashboard, and are the easiest
-  thing to keep in `LAZYPATH_TOKENS` by hand.
+- Platform keys and browser cookies paste fine on the deployed dashboard either way.
 - Rotating the password from the dashboard is refused. In env-managed mode, change
   `LAZYPATH_PASSWORD` and redeploy; every existing session cookie stops working, because the
   password signs them. In D1 mode the password was chosen at sign-up and lives hashed in the
@@ -239,8 +273,8 @@ requests, so:
 ## Tests
 
 ```
-npm test          # 186 checks: every wire format, fallback, streaming, presets, usage, auth,
-                  # serverless mode, D1 accounts, then the artifact Vercel actually runs
+npm test          # 193 checks: every wire format, fallback, streaming, presets, usage, auth,
+                  # serverless mode, D1 accounts and D1 tokens, then the artifact Vercel runs
 npm run typecheck
 ```
 
@@ -248,8 +282,10 @@ npm run typecheck
 `test/e2e.mjs` drives a real gateway on a port; `test/serverless.mjs` imports the handler with
 `VERCEL=1` and drives it with mock req/res, because in that mode there is no port to bind.
 `test/accounts.mjs` stands up a mock Cloudflare D1 REST endpoint and proves the one-owner claim,
-scrypt-hashed storage, stateless sessions across a cold instance, the local no-database fallback,
-and graceful 502s when the database is unreachable.
+scrypt-hashed storage, stateless sessions across a cold instance, the token table (env seed,
+a login saved from the deployed dashboard, a disconnect that sticks, a cold instance that reads
+the row straight out of D1), the local no-database fallback, and graceful 502s when the database
+is unreachable.
 `test/vercel-build.mjs` runs the build and drives `api/index.ts` → `lazypath.js`, so a `.ts`
 specifier or a config that throws at import time cannot reach the platform unnoticed.
 

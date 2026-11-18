@@ -22,6 +22,7 @@ function check(name, cond, extra = "") {
 
 // ---- the mock D1 endpoint -----------------------------------------------------
 const rows = [];
+const store = new Map();
 const queries = [];
 const d1 = createServer((req, res) => {
   let body = "";
@@ -37,6 +38,15 @@ const d1 = createServer((req, res) => {
     queries.push(sql);
     const ok = (results, meta = {}) => send(200, { success: true, errors: [], result: [{ results, meta }] });
     if (sql.startsWith("CREATE TABLE")) return ok([]);
+    if (sql.startsWith("SELECT key, json FROM store")) return ok([...store].map(([key, json]) => ({ key, json })));
+    if (sql.startsWith("INSERT INTO store")) {
+      store.set(params[0], params[1]);
+      return ok([], { changes: 1 });
+    }
+    if (sql.startsWith("DELETE FROM store")) {
+      store.delete(params[0]);
+      return ok([], { changes: 1 });
+    }
     if (sql.startsWith("INSERT INTO accounts")) {
       if (rows.length) return ok([], { changes: 0 });
       rows.push({ username: params[0], hash: params[1], created: params[2] });
@@ -177,6 +187,17 @@ try {
   check("basic auth works against D1", (await get("/api/summary", basic)).status === 200);
   check("wrong basic is refused", (await get("/api/summary", { authorization: "Basic " + Buffer.from(`${OWNER}:nope`).toString("base64") })).status === 401);
 
+  // ---- the token store lives in D1, not on this instance ----------------------------
+  check("the store table was created", queries.some((q) => q.startsWith("CREATE TABLE IF NOT EXISTS store")));
+  check("the env seed was copied into D1 once", store.get("meta:tokens") === "1" && String(store.get("token:okmock")).includes("seeded-token"));
+  const pasted = await post("/api/finish", { provider: "pastedmock", code: "good-code" }, bearer);
+  check("a login completed on the deployed dashboard", pasted.status === 200 && pasted.json().ok === true, pasted.text().slice(0, 100));
+  check("that token went to D1 rather than only to /tmp", String(store.get("token:pastedmock")).includes('"provider":"pastedmock"'));
+  await post("/api/disconnect", { provider: "okmock" }, bearer);
+  check("disconnect removes the row from D1", !store.has("token:okmock"));
+  const afterDrop = (await get("/api/summary", bearer)).json();
+  check("the env seed cannot resurrect a disconnected provider", afterDrop.providers.find((p) => p.id === "okmock")?.connected !== true);
+
   // ---- rotation and sign-out -----------------------------------------------------------
   const rot = await post("/api/rotate", {}, bearer);
   check("rotation is refused in D1 mode", rot.status === 400 && rot.json().error?.message?.includes("D1"));
@@ -184,20 +205,71 @@ try {
   check("sign-out clears the cookie", out.status === 302 && (out.headers["set-cookie"] ?? "").includes("Max-Age=0"));
 
   // ---- a cold instance verifies the same cookie ------------------------------------------
-  const cold = spawnSync(process.execPath, ["--input-type=module", "-e", `
+  // spawn, not spawnSync: the mock D1 answers from this process, so the parent's event loop
+  // has to stay free while the child reads its tokens out of the database.
+  const cold = await new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", `
 import { Readable, Writable } from "node:stream";
 const { default: h } = await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "lazypath.ts")).href)});
 class R extends Writable { constructor(){super();this.parts=[]} setHeader(){} writeHead(s){this.status=s;return this} _write(c,e,cb){this.parts.push(Buffer.from(c));cb()} }
-async function hit(url, cookie) {
+async function hit(url, cookie, raw) {
   const res = new R(); const done = new Promise((r) => res.on("finish", r));
   const req = Readable.from([]); req.method = "GET"; req.url = url; req.headers = { host: "x.vercel.app", cookie };
-  await h(req, res); await done; return res.status;
+  await h(req, res); await done; return raw ? Buffer.concat(res.parts).toString() : res.status;
 }
-console.log(await hit("/api/summary", ${JSON.stringify(`lp_session=${session}`)}));
-console.log(await hit("/", ${JSON.stringify(`lp_session=${session}`)}));
-`], { encoding: "utf8", env: { ...process.env } });
-  const coldLines = cold.stdout.trim().split("\n");
-  check("a fresh instance accepts the session cookie", cold.status === 0 && coldLines[0] === "200" && coldLines[1] === "200", (cold.stderr || cold.stdout || "").trim().split("\n").slice(-2).join(" ").slice(0, 160));
+const jar = ${JSON.stringify(`lp_session=${session}`)};
+console.log(await hit("/api/summary", jar));
+console.log(await hit("/", jar));
+const seen = JSON.parse(await hit("/api/summary", jar, true));
+console.log(seen.providers.find((p) => p.id === "pastedmock")?.connected === true);
+console.log(String(seen.providers.find((p) => p.id === "okmock")?.connected));
+`], { env: process.env });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (c) => (out += c));
+    child.stderr.on("data", (c) => (err += c));
+    child.on("close", (code) => resolve({ code, out, err }));
+  });
+  const coldLines = cold.out.trim().split(/\r?\n/);
+  check("a fresh instance accepts the session cookie", cold.code === 0 && coldLines[0] === "200" && coldLines[1] === "200", (cold.err || cold.out).trim().split(/\r?\n/).slice(-2).join(" ").slice(0, 160));
+  check("a cold instance reads the token straight out of D1", coldLines[2] === "true" && coldLines[3] === "false", coldLines.join(" | "));
+
+  // ---- a local gateway links into the very same database --------------------------------
+  // The point of the store table: a provider linked in the process that *can* keep a poller
+  // alive lands in D1, and the deployment reads that row.
+  const LINK_HOME = mkdtempSync(join(tmpdir(), "lazypath-d1local-"));
+  const seededRow = store.get("token:pastedmock");
+  const localLink = await new Promise(async (resolve) => {
+    const env = { ...process.env, PORT: "8793", LAZYPATH_HOME: LINK_HOME };
+    delete env.VERCEL;
+    const child = spawn(process.execPath, ["lazypath.ts"], { env, stdio: "ignore" });
+    try {
+      for (let i = 0; i < 120; i++) {
+        try {
+          if ((await fetch("http://127.0.0.1:8793/api/summary")).ok) break;
+        } catch {
+          /* not listening yet */
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const r = await fetch("http://127.0.0.1:8793/api/finish", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: "pastedmock", code: "good-code" }),
+      });
+      resolve(await r.text());
+    } catch (e) {
+      resolve(`local gateway never came up: ${String(e)}`);
+    } finally {
+      child.kill();
+      rmSync(LINK_HOME, { recursive: true, force: true });
+    }
+  });
+  check(
+    "a local gateway writes its link into the shared database",
+    localLink.includes('"ok":true') && String(store.get("token:pastedmock")) !== String(seededRow),
+    localLink.slice(0, 90),
+  );
 
   // ---- a dead database degrades to an error page, not a crash -----------------------------
   await new Promise((r) => d1.close(r));

@@ -95,6 +95,23 @@ const CONFIG_FILE = join(DATA_DIR, "config.json");
 const TOKENS_FILE = join(DATA_DIR, "tokens.json");
 const USAGE_FILE = join(DATA_DIR, "usage.json");
 
+// The gateway home can hold a .cloudflare.env with the three values; real env vars win.
+// Parsed here, next to the files it sits beside, because both the account and the token
+// store need to know whether a database exists before anything else runs.
+const cfEnvFile = join(DATA_DIR, ".cloudflare.env");
+if (existsSync(cfEnvFile)) {
+  for (const line of readFileSync(cfEnvFile, "utf8").split(/\r?\n/)) {
+    const m = /^\s*(CLOUDFLARE_[A-Z_]+)\s*=\s*(.*?)\s*$/.exec(line);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+  }
+}
+
+const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
+const CF_DB = process.env.CLOUDFLARE_D1_DATABASE_ID ?? process.env.CLOUDFLARE_DATABASE_ID ?? "";
+const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
+const CF_API = (process.env.CLOUDFLARE_API_BASE || "https://api.cloudflare.com/client/v4").replace(/\/+$/, "");
+const D1 = !!(CF_ACCOUNT && CF_DB && CF_TOKEN);
+
 function readJson<T>(file: string, fallback: T): T {
   if (!existsSync(file)) return fallback;
   try {
@@ -171,7 +188,18 @@ function loadConfig(): Config {
 const saveConfig = (cfg: Config) => writeJson(CONFIG_FILE, cfg);
 /** Once the file exists it is the whole store, not a delta over the env seed -
  *  otherwise disconnecting a provider would let the env entry resurrect it. */
-const loadTokens = () => readJson<Record<string, TokenSet> | null>(TOKENS_FILE, null) ?? envJson<Record<string, TokenSet>>("LAZYPATH_TOKENS") ?? {};
+const localTokens = () => readJson<Record<string, TokenSet> | null>(TOKENS_FILE, null) ?? envJson<Record<string, TokenSet>>("LAZYPATH_TOKENS") ?? {};
+
+/** With a D1 database configured the tokens live there instead of on this machine, so a
+ *  device login done in the local gateway is immediately usable by the deployment. Every
+ *  reader below stays synchronous and reads this cache; requests refresh it first. */
+let tokenCache: Record<string, TokenSet> | null = null;
+let tokenWrites: Promise<void>[] = [];
+
+function loadTokens(): Record<string, TokenSet> {
+  if (!D1) return localTokens();
+  return tokenCache ?? {};
+}
 
 /** Keyless providers are always connected: they get a placeholder entry here rather
  *  than on disk, so nothing can revoke or expire. */
@@ -182,15 +210,101 @@ function tokenStore(): Record<string, TokenSet> {
 }
 
 function saveToken(token: TokenSet) {
-  const all = loadTokens();
+  const all = localTokens();
   all[token.provider] = token;
   writeJson(TOKENS_FILE, all);
+  if (D1 && tokenCache) tokenCache[token.provider] = token;
+  queueToken(`token:${token.provider}`, JSON.stringify(token));
 }
 
 function clearToken(provider: string) {
-  const all = loadTokens();
+  const all = localTokens();
   delete all[provider];
   writeJson(TOKENS_FILE, all);
+  if (D1 && tokenCache) delete tokenCache[provider];
+  queueDrop(provider);
+}
+
+const TOKENS_READY = "meta:tokens";
+const TOKEN_UPSERT = "INSERT INTO store (key, json, updated) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated = excluded.updated";
+
+let storeSchema: Promise<void> | null = null;
+/** One row per provider, keyed `token:<id>`, plus a `meta:tokens` marker. Created on first
+ *  use, exactly like the accounts table. */
+function d1Store(): Promise<void> {
+  if (!storeSchema) {
+    storeSchema = d1Query("CREATE TABLE IF NOT EXISTS store (key TEXT PRIMARY KEY, json TEXT NOT NULL, updated INTEGER NOT NULL)")
+      .then(() => {})
+      .catch((e) => {
+        storeSchema = null;
+        throw e;
+      });
+  }
+  return storeSchema;
+}
+
+function queueToken(key: string, json: string) {
+  if (!D1) return;
+  tokenWrites.push(d1Query(TOKEN_UPSERT, [key, json, Date.now()]).then(() => {}));
+}
+
+function queueDrop(provider: string) {
+  if (!D1) return;
+  tokenWrites.push(d1Query("DELETE FROM store WHERE key = ?", [`token:${provider}`]).then(() => {}));
+}
+
+/** Pull the token store out of D1 and make it what the synchronous readers see. An empty
+ *  database adopts whatever this machine already has (the file, or LAZYPATH_TOKENS) exactly
+ *  once - after that the database is the whole store, so a disconnect sticks. */
+let tokensDownAt = 0;
+async function hydrateTokens(): Promise<void> {
+  if (!D1) {
+    tokenCache = null;
+    return;
+  }
+  // A database that will not answer is retried at most every 15s: the dashboard polls the
+  // summary every 3 and each attempt costs the full fetch timeout, so without this a
+  // Cloudflare hiccup would stack requests instead of just showing this instance's copy.
+  if (tokensDownAt && Date.now() - tokensDownAt < 15000) return;
+  const all: Record<string, TokenSet> = {};
+  try {
+    await d1Store();
+    const q = await d1Query("SELECT key, json FROM store");
+    const rows = new Map<string, string>();
+    for (const r of q.results ?? []) rows.set(String(r.key), String(r.json));
+    if (!rows.has(TOKENS_READY)) {
+      const seed = localTokens();
+      for (const [id, set] of Object.entries(seed)) rows.set(`token:${id}`, JSON.stringify(set));
+      rows.set(TOKENS_READY, "1");
+      for (const [key, json] of rows) await d1Query(TOKEN_UPSERT, [key, json, Date.now()]);
+    }
+    for (const [key, json] of rows) {
+      if (!key.startsWith("token:")) continue;
+      try {
+        all[key.slice(6)] = JSON.parse(json) as TokenSet;
+      } catch {
+        /* a row this build cannot read is worse than not being connected: drop it from view */
+      }
+    }
+    tokensDownAt = 0;
+  } catch (e) {
+    // A read that fails must not fail the request: serve from this machine's own store and
+    // try the database again soon. Writes still throw, so a login that cannot be saved is
+    // reported instead of silently lost.
+    tokensDownAt = Date.now();
+    console.error(`lazypath: the D1 token store is not readable, using this instance's copy: ${String(e)}`);
+    Object.assign(all, localTokens());
+  }
+  tokenCache = all;
+}
+
+/** Serverless freezes the instance as soon as the response is done, so a queued write has to
+ *  be on its way to Cloudflare before then. Throws so a login route can report the failure. */
+async function flushTokens(): Promise<void> {
+  if (!tokenWrites.length) return;
+  const pending = tokenWrites;
+  tokenWrites = [];
+  await Promise.all(pending);
 }
 
 const emptyRow = (): UsageRow => ({ requests: 0, ok: 0, failed: 0, inputTokens: 0, outputTokens: 0, lastUsedAt: 0 });
@@ -1614,6 +1728,8 @@ function watchDeviceLogin(providerId: string, session: DeviceSession) {
       if (token) {
         clearInterval(entry.timer);
         activeLogins.delete(providerId);
+        // this timer runs outside any request, so nothing else would push the token to D1
+        await flushTokens().catch((e) => console.error(`lazypath: the login worked but saving it failed: ${String(e)}`));
         return;
       }
     } catch {
@@ -4053,7 +4169,7 @@ function render(){
   var f=document.getElementById("faas");
   if(S.serverless){
     f.style.display="";
-    f.innerHTML='<div class="wait">Serverless mode: there is no durable disk here, so a connection you make on this page lasts only until the next cold start. Put it in the <code>LAZYPATH_TOKENS</code> env var to keep it. Device-code logins need a process that stays alive - link those locally with <code>node lazypath.ts</code>, then copy them over with <code>lazypath export</code>.'+(S.accountMode==="cloudflare"?' Your sign-in account lives in Cloudflare D1, so it survives cold starts.':'')+'</div>';
+    f.innerHTML='<div class="wait">'+(S.accountMode==="cloudflare"?'Serverless, but the tokens live in Cloudflare D1 next to your account, so what you connect here survives a cold start. Device-code logins still need a process that stays alive: run <code>node lazypath.ts</code> locally with the same <code>CLOUDFLARE_*</code> values and the login shows up on this page shortly after.':'Serverless mode: there is no durable disk here, so a connection you make on this page lasts only until the next cold start. Put it in the <code>LAZYPATH_TOKENS</code> env var to keep it. Device-code logins need a process that stays alive - link those locally with <code>node lazypath.ts</code>, then copy them over with <code>lazypath export</code>.')+'</div>';
     document.getElementById("rot").style.display="none";
   }
   if(S.accountMode==="cloudflare")document.getElementById("rot").style.display="none";
@@ -4483,6 +4599,7 @@ if (ARGS.includes("--version") || ARGS.includes("-v")) {
   process.exit(0);
 }
 if (ARGS[0] === "export") {
+  await hydrateTokens();
   console.log(JSON.stringify(loadTokens()));
   process.exit(0);
 }
@@ -4531,21 +4648,6 @@ function html(res: ServerResponse, status: number, body: string) {
 // lives in a D1 database over plain REST fetch (no SDK, no dependency), so it survives
 // serverless cold starts. Without them the account is the local config file, and on a
 // public host sign-up stays closed until a database or LAZYPATH_PASSWORD is configured.
-
-// The gateway home can hold a .cloudflare.env with the three values; real env vars win.
-const cfEnvFile = join(DATA_DIR, ".cloudflare.env");
-if (existsSync(cfEnvFile)) {
-  for (const line of readFileSync(cfEnvFile, "utf8").split(/\r?\n/)) {
-    const m = /^\s*(CLOUDFLARE_[A-Z_]+)\s*=\s*(.*?)\s*$/.exec(line);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
-  }
-}
-
-const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
-const CF_DB = process.env.CLOUDFLARE_D1_DATABASE_ID ?? process.env.CLOUDFLARE_DATABASE_ID ?? "";
-const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
-const CF_API = (process.env.CLOUDFLARE_API_BASE || "https://api.cloudflare.com/client/v4").replace(/\/+$/, "");
-const D1 = !!(CF_ACCOUNT && CF_DB && CF_TOKEN);
 
 interface AccountRow {
   username: string;
@@ -5154,7 +5256,7 @@ const CORS: Record<string, string> = {
   "access-control-max-age": "600",
 };
 
-const handle = async (req: IncomingMessage, res: ServerResponse) => {
+async function route(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const base = `${SERVERLESS ? "https" : "http"}://${req.headers.host ?? `localhost:${PORT}`}`;
   for (const k in CORS) res.setHeader(k, CORS[k]);
@@ -5230,6 +5332,9 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (!(await authed(req)) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models")) {
       return json(res, 401, { error: { message: "bad lazypath login" } });
     }
+    // With D1 the database holds the tokens, so refresh this request's view of it once,
+    // here, before anything reads the store.
+    if (D1 && (url.pathname.startsWith("/api/") || url.pathname.startsWith("/v1/"))) await hydrateTokens();
     if (url.pathname === "/api/summary") return json(res, 200, await summary(base));
 
     if (req.method === "POST" && url.pathname.startsWith("/api/")) {
@@ -5242,7 +5347,9 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         if (SERVERLESS && (provider.login === "device" || STATEFUL_PASTE.has(provider.id))) {
           return json(res, 400, {
             error: {
-              message: `${provider.label} needs a login that stays alive between requests, which serverless does not give us. Connect it locally with "node lazypath.ts", then run "lazypath export" and put that JSON in the LAZYPATH_TOKENS env var.`,
+              message: D1
+                ? `${provider.label} needs a login that stays alive between requests, which serverless does not give us. Run "node lazypath.ts" locally and connect it there - this deployment reads its tokens from the same Cloudflare D1 database, so it appears here on the next refresh.`
+                : `${provider.label} needs a login that stays alive between requests, which serverless does not give us. Connect it locally with "node lazypath.ts", then run "lazypath export" and put that JSON in the LAZYPATH_TOKENS env var.`,
             },
           });
         }
@@ -5269,6 +5376,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         if (!session) return json(res, 400, { error: { message: "start the login first" } });
         try {
           await session.finish(String(body.code ?? ""));
+          await flushTokens();
           pasteSessions.delete(provider!.id);
           return json(res, 200, { ok: true });
         } catch (e) {
@@ -5283,6 +5391,11 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         if (login) {
           clearInterval(login.timer);
           activeLogins.delete(id);
+        }
+        try {
+          await flushTokens();
+        } catch (e) {
+          return json(res, 502, { error: { message: `the token is gone from this instance but D1 refused the delete: ${String(e)}` } });
         }
         return json(res, 200, { ok: true });
       }
@@ -5440,6 +5553,16 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     json(res, 404, { error: { message: "not found" } });
   } catch (e) {
     json(res, 500, { error: { message: String(e) } });
+  }
+}
+
+/** A serverless instance is frozen the moment the response ends, which would drop any token
+ *  write still in flight, so every request drains the queue on its way out. */
+const handle = async (req: IncomingMessage, res: ServerResponse) => {
+  try {
+    await route(req, res);
+  } finally {
+    await flushTokens().catch((e) => console.error(`lazypath: D1 refused the token store: ${String(e)}`));
   }
 };
 
