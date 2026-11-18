@@ -17,11 +17,17 @@ lazypath            # starts the gateway and opens the dashboard
 ```
 
 `node lazypath.ts` works exactly the same if you would rather not install it. Flags:
-`--port <n>`, `--host <addr>`, `--no-open`, `--version`, `help`. Running a second copy just
-prints the dashboard of the one that is already up.
+`--port <n>`, `--host <addr>`, `--no-open`, `--version`, `help`, and `export` (prints the token
+store as JSON — see [Deploy to Vercel](#deploy-to-vercel)). Running a second copy just prints
+the dashboard of the one that is already up.
 
 Single file, zero runtime dependencies, Node >= 24 (it runs the TypeScript directly).
 Config, tokens and usage live in `~/.lazypath/` — delete that folder to reset.
+
+The dashboard is open on loopback because nothing else can reach it. Bind anywhere else
+(`--host 0.0.0.0`, or a Vercel deployment) and every page and API route asks for the gateway
+key first: `Authorization: Bearer lp-...`, or the key-entry form at `/` which sets an
+`HttpOnly` cookie the dashboard then rides.
 
 ## Use it
 
@@ -46,14 +52,22 @@ The response carries `x-lazypath-provider` and `x-lazypath-model` so you can see
 
 This is the part worth knowing before you trust any gateway (including OmniRoute) on this claim.
 Provider definitions come from each service's own CLI source or its web app, not guesses.
-22 providers ship in four flavours:
+34 providers ship in five flavours:
 
 | how you link | providers |
 | --- | --- |
 | **device code** | Kimi, GitHub Copilot, Kiro (AWS), Tencent CodeBuddy, ChatGPT (Codex), Grok |
 | **browser cookie** | Z.ai, Inner AI, Perplexity, Claude, Kimi web, Doubao, HuggingChat, ZenMux Free, Adapta, Hyperagent |
 | **pasted key** | Qoder, GitLab, Anthropic, Qwen Cloud, MiniMax |
+| **platform key** | OpenRouter, Groq, Cerebras, Mistral, Google AI Studio, SambaNova, NVIDIA NIM, DeepInfra, ModelScope, Novita, Together AI, DeepSeek |
 | **nothing** | Pollinations (anonymous models, always connected) |
+
+The platform-key group is the one purchase most of these free tiers anyway: OpenRouter's
+`:free` ids, Groq, Cerebras, SambaNova, NVIDIA NIM, ModelScope and Google AI Studio all give
+you a key without a card. Every one of them speaks the OpenAI wire, so they need no
+translation — paste the key and the gateway checks it against that provider's `/models`
+before storing it, which turns a bad paste into an error now instead of a silent fallback on
+your first chat.
 
 Click **Connect** and the dashboard does the right one of those: a code to approve, a page to
 sign in on plus a paste box, or nothing at all. Device logins refresh themselves, serialised so
@@ -78,7 +92,13 @@ Three things that used to work and no longer do:
   transport, so there is no completion to translate. lazypath links MiniMax with a platform key
   against the Anthropic-compatible endpoint, checked against `/v1/models` when you paste it.
 - **OpenAI / Google** consumer logins stay out: ChatGPT-account tokens are Codex-CLI-only and
-  Google's free tier rides its own embedded client id and is being closed off.
+  Google's free tier rides its own embedded client id and is being closed off. Google ships
+  here as **AI Studio with a platform key** instead, which is a supported first-party path.
+
+Three candidates were probed and left out rather than shipped on a guess: Fireworks and
+SiliconFlow publish their model ids only inside a JavaScript app, so there was no honest list
+to embed, and `models.github.ai/inference` answers `200 OK` to every path — a catch-all, not an
+OpenAI route.
 
 ## Wire formats
 
@@ -88,14 +108,64 @@ bespoke shapes of HuggingChat, Kimi web, Doubao, Z.ai web, Inner AI, Perplexity 
 ZenMux, Adapta (Clerk-minted session token) and Hyperagent (thread bootstrap).
 Tool calls and multimodal content are not translated yet — text-only today.
 
+## Deploy to Vercel
+
+The same single file runs as a serverless function. `api/index.ts` re-exports its request
+handler and `vercel.json` routes every path to it, so the dashboard, the API and the OpenAI
+endpoint all live at your deployment URL.
+
+1. Push this repo to GitHub.
+2. In Vercel, **Add New > Project** and import it. Framework preset **Other**, Node **24.x**.
+   There is no build step.
+3. Set the environment variables below, then deploy.
+
+| variable | what it is |
+| --- | --- |
+| `LAZYPATH_GATEWAY_KEY` | the `lp-...` key your apps send as `Authorization: Bearer`. Set it, or a cold start invents a new one and your callers break. |
+| `LAZYPATH_TOKENS` | the token store as JSON — this is what makes connections survive. Get it from `lazypath export` on your machine. |
+| `LAZYPATH_CONFIG` | optional: presets and the disabled list as JSON, same shape as `~/.lazypath/config.json`. |
+
+```bash
+curl https://your-app.vercel.app/v1/chat/completions \
+  -H "Authorization: Bearer lp-yourkey" -H "content-type: application/json" \
+  -d '{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+Open `https://your-app.vercel.app/` and it asks for that key before showing anything. The
+key becomes an `HttpOnly` cookie, so the dashboard works normally afterwards.
+
+**What serverless changes.** There is no durable disk and no process that stays alive between
+requests, so:
+
+- Connections you make on the deployed dashboard last only until the next cold start. Put them
+  in `LAZYPATH_TOKENS` to keep them. Usage bars reset the same way.
+- Device-code logins (Kimi, Copilot, Kiro, Codex, Grok, Tencent) and the two PKCE paste flows
+  (GitLab, Anthropic) are **refused** there — they need a poller or a verifier that outlives one
+  request. Link them locally instead:
+
+  ```
+  lazypath            # connect the providers in the local dashboard
+  lazypath export     # prints the token store JSON — paste it into LAZYPATH_TOKENS
+  ```
+
+  `export` prints live credentials. Treat its output like a password.
+- Platform keys and browser cookies paste fine on the deployed dashboard, and are the easiest
+  thing to keep in `LAZYPATH_TOKENS` by hand.
+- Rotating the key from the dashboard is refused; change `LAZYPATH_GATEWAY_KEY` and redeploy.
+- `vercel.json` sets `maxDuration: 60` so a streamed answer is not cut off. Raise it if your
+  plan allows and your generations run longer.
+
 ## Tests
 
 ```
-npm test          # 60 checks: every wire format, fallback, streaming, presets, usage, auth
+npm test          # 92 checks: every wire format, fallback, streaming, presets, usage, auth,
+                  # then the serverless mode (key gate, env-seeded store, refused logins)
 npm run typecheck
 ```
 
 `test/mock-provider.mjs` is a local stub; mock providers only load with `LAZYPATH_MOCKS=1`.
+`test/e2e.mjs` drives a real gateway on a port; `test/serverless.mjs` imports the handler with
+`VERCEL=1` and drives it with mock req/res, because in that mode there is no port to bind.
 
 ## Honest caveats
 
@@ -104,7 +174,10 @@ npm run typecheck
   accounts, personally. Everything marked *ToS risk* in the dashboard rides a browser session.
 - OAuth endpoints drift without notice; a provider can start rejecting non-official clients
   (Google already does with opaque 403s, Qwen with a WAF block page).
-- Model lists are static per provider. Real discovery needs a connected account.
+- Model lists are static per provider. Real discovery needs a connected account. The
+  platform-key ids were read from each provider's public catalog or its own docs, and every
+  chat route was probed live before shipping — but a provider can rename a model tomorrow.
 - Usage stats are best-effort: streaming responses count the request but not the tokens.
-- Brand marks are the providers' own: simple-icons (CC0) where that set has them, otherwise the
-  site's favicon/logo SVG recoloured for the black tile, or the PNG for Pollinations.
+- Brand marks are the providers' own: simple-icons (CC0) and `@lobehub/icons-static-svg` where
+  those sets have them, otherwise the site's favicon/logo SVG recoloured for the black tile, or
+  the PNG for Pollinations. No provider falls back to a letter placeholder.

@@ -116,8 +116,8 @@ async function main() {
   check("usage bar data: failing provider counted", summary.providers.find((p) => p.id === "failmock")?.usage.failed >= 1);
   check("usage bar data: tokens recorded", summary.providers.find((p) => p.id === "okmock")?.usage.inputTokens >= 0);
 
-  const unknown = await post("/api/connect", { provider: "deepseek" });
-  check("connect on unknown provider errors cleanly", unknown.status >= 400);
+  const unknown = await post("/api/connect", { provider: "no-such-provider" });
+  check("connect on unknown provider errors cleanly", unknown.status === 404);
 
   // Anthropic wire-format provider: request translated out, response translated back.
   await connect("anthmock");

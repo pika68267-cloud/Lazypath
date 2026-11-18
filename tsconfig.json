@@ -12,5 +12,5 @@
     "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["lazypath.ts"]
+  "include": ["lazypath.ts", "api/**/*.ts"]
 }

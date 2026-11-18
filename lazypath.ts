@@ -8,7 +8,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -82,7 +82,12 @@ interface Config {
 
 // --------------------------------------------------------------------------- store
 
-const DATA_DIR = process.env.LAZYPATH_HOME ?? join(homedir(), ".lazypath");
+/** Vercel (and any other FaaS) gives us no durable disk and no process that stays
+ *  alive between requests: /tmp is writable but per-instance, and a cold start
+ *  wipes it. So the store is seeded from the environment there, and the dashboard
+ *  is only a scratchpad on top of it. */
+const SERVERLESS = !!process.env.VERCEL;
+const DATA_DIR = process.env.LAZYPATH_HOME ?? (SERVERLESS ? join(tmpdir(), "lazypath") : join(homedir(), ".lazypath"));
 const CONFIG_FILE = join(DATA_DIR, "config.json");
 const TOKENS_FILE = join(DATA_DIR, "tokens.json");
 const USAGE_FILE = join(DATA_DIR, "usage.json");
@@ -93,6 +98,16 @@ function readJson<T>(file: string, fallback: T): T {
     return JSON.parse(readFileSync(file, "utf8")) as T;
   } catch {
     return fallback;
+  }
+}
+
+function envJson<T>(name: string): T | null {
+  const raw = process.env[name];
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
   }
 }
 
@@ -108,8 +123,9 @@ const DEFAULT_PRESETS: Presets = {
 };
 
 function loadConfig(): Config {
-  if (existsSync(CONFIG_FILE)) {
-    const cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as Config;
+  const stored = existsSync(CONFIG_FILE) ? (JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as Config) : envJson<Config>("LAZYPATH_CONFIG");
+  if (stored) {
+    const cfg = stored;
     if (!Array.isArray(cfg.disabled)) cfg.disabled = [];
     // a config written by an older build can name providers that no longer ship,
     // which would leave a preset resolving to an empty chain
@@ -119,10 +135,15 @@ function loadConfig(): Config {
       const kept = (cfg.presets[name] ?? []).filter((id) => known.has(id));
       cfg.presets[name] = kept.length ? kept : DEFAULT_PRESETS[name];
     }
+    cfg.deviceId ??= randomBytes(16).toString("hex");
+    cfg.port ??= 8787;
+    // the env key is what the caller's app is configured with, so it outranks any
+    // key a warm instance happened to generate before the env var was set
+    if (process.env.LAZYPATH_GATEWAY_KEY) cfg.gatewayKey = process.env.LAZYPATH_GATEWAY_KEY;
     return cfg;
   }
   const cfg: Config = {
-    gatewayKey: `lp-${randomBytes(16).toString("hex")}`,
+    gatewayKey: process.env.LAZYPATH_GATEWAY_KEY ?? `lp-${randomBytes(16).toString("hex")}`,
     port: 8787,
     deviceId: randomBytes(16).toString("hex"),
     disabled: [],
@@ -133,7 +154,9 @@ function loadConfig(): Config {
 }
 
 const saveConfig = (cfg: Config) => writeJson(CONFIG_FILE, cfg);
-const loadTokens = () => readJson<Record<string, TokenSet>>(TOKENS_FILE, {});
+/** Once the file exists it is the whole store, not a delta over the env seed -
+ *  otherwise disconnecting a provider would let the env entry resurrect it. */
+const loadTokens = () => readJson<Record<string, TokenSet> | null>(TOKENS_FILE, null) ?? envJson<Record<string, TokenSet>>("LAZYPATH_TOKENS") ?? {};
 
 /** Keyless providers are always connected: they get a placeholder entry here rather
  *  than on disk, so nothing can revoke or expire. */
@@ -196,6 +219,18 @@ const MARKS: Record<string, string> = {
   zenmux: "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"160\" height=\"160\" xmlns=\"http://www.w3.org/2000/svg\" fill=\"none\"><path fill=\"#f8fafc\" d=\"M77.776.421c8.25-.317 24.947.775 38.304 12.768 10.957 9.839 14.733 28.078 12.18 42.221-2.341 12.965-7.858 23.572-5.696 33.394 2.16 9.821 7.658 14.663 12.334 16.696 4.519 1.965 8.886 1.375 8.055 5.108-.832 3.732-6.482 5.107-10.608 5.107-2.262 0-9.103-.59-12.139-2.554-3.587-2.322-4.386-4.402-5.752-6.074-.231-.284-.64-.087-.586.276.622 4.113 2.338 11.094 5.12 15.423 2.252 3.503 3.183 6.058 8.341 10.38 5.16 4.32 7.57 8.249 2.553 11.031-4.456 2.471-14.142-2.585-19.839-8.839-5.127-5.629-8.697-12.572-10.108-17.09-.755-2.415-1.511-6.57-2.266-9.969-.1-.446-.711-.374-.725.084-.25 8.649-1.61 16.909-3.598 25.764-1.43 6.375-4.91 14.143-8.053 18.857-3.833 5.749-9.522 7.543-13.75 5.971-3.382-1.257-.983-5.531 0-9.232.982-3.7 2.947-11.439 4.27-19.918 1.197-7.674 1.514-15.271.981-22.47-.033-.439-.708-.506-.844-.087-1.102 3.376-3.18 8.972-4.696 12.376-3.162 7.099-5.501 10.214-11.983 17.677-5.83 6.714-22.597 16.207-24.75 6.876-.59-2.553 2.498-3.671 5.345-5.893 4.28-3.339 7.857-9.264 11.248-16.5 3.045-6.497 4.592-12.782 4.83-16.794.022-.387-.464-.533-.682-.213-1.41 2.067-3.485 4.865-5.771 7.185-3.819 3.877-8.054 7.867-12.966 9.822-7.897 3.143-15.95.982-15.361-4.714.492-4.758 5.804-3.773 12.416-10.987 6.482-7.072 8.643-12.573 9.035-18.662.314-4.872-4.451-16.434-6.874-21.607-3.863-8.25-6.718-31.665 4.91-46.75C55.188.226 72.67.617 77.777.42zM55.101 33.397c-5.408 0-8.112 4.151-8.112 9.272 0 5.12 3.004 9.271 8.112 9.271 5.108 0 8.113-4.15 8.113-9.271 0-5.12-2.705-9.272-8.113-9.272zm44.04 0c-5.408 0-8.112 4.151-8.113 9.272 0 5.12 3.005 9.271 8.113 9.271s8.113-4.15 8.113-9.271c0-5.12-2.705-9.272-8.113-9.272z\" clip-rule=\"evenodd\" fill-rule=\"evenodd\"/></svg>",
   adapta: "<svg width=\"512\" height=\"512\" viewBox=\"0 0 512 512\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"512\" height=\"512\" rx=\"140\" fill=\"#141414\"/><path d=\"M146.969 421.164L241.631 421.29H266.602C270.195 421.315 273.536 419.408 275.32 416.27L295.167 381.762C298.734 375.563 298.734 367.909 295.167 361.735L282.304 339.474C280.52 336.362 277.204 334.455 273.612 334.455L226.105 334.354C225.854 334.354 225.628 334.304 225.377 334.304H201.686C201.611 334.304 201.51 334.304 201.435 334.304L76.2495 334.429C72.657 334.429 69.3659 336.337 67.5571 339.449L54.6944 361.71C51.1019 367.909 51.1019 375.538 54.6944 381.737L74.5412 416.245C76.3248 419.357 79.6661 421.29 83.2587 421.29H108.23L146.969 421.114V421.164Z\" fill=\"white\"/><path d=\"M308.212 313.38L367.878 416.98C369.687 420.092 373.003 422.025 376.596 422L416.44 421.924C423.599 421.924 430.207 418.085 433.799 411.886L446.662 389.625C448.446 386.513 448.446 382.698 446.662 379.611L422.997 338.477C422.896 338.251 422.796 338.025 422.67 337.825L413.902 322.666L410.837 317.346C410.837 317.346 410.737 317.22 410.687 317.145L347.981 208.902C346.172 205.815 342.881 203.907 339.289 203.907H313.563C306.403 203.907 299.771 207.722 296.178 213.896L276.181 248.304C274.372 251.416 274.372 255.256 276.181 258.368L288.692 279.976L308.187 313.43L308.212 313.38Z\" fill=\"white\"/><path d=\"M244.275 229.91L304.242 126.46C306.051 123.348 306.051 119.509 304.242 116.396L284.245 81.9886C280.652 75.8147 274.045 72 266.86 72H241.135C237.542 72 234.251 73.9074 232.442 76.9943L208.601 118.053C208.475 118.253 208.325 118.454 208.199 118.655L199.431 133.839L196.341 139.16C196.341 139.16 196.266 139.31 196.241 139.385L133.761 247.754C131.977 250.866 131.977 254.681 133.761 257.768L146.624 280.029C150.216 286.227 156.824 290.042 163.984 290.068L203.828 290.143C207.42 290.143 210.762 288.235 212.57 285.123L225.031 263.49L244.275 229.91Z\" fill=\"white\"/></svg>",
   hyperagent: "<svg width=\"512\" height=\"512\" viewBox=\"-3 -3 28 28\" shape-rendering=\"geometricPrecision\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"><path fill=\"#f8fafc\" d=\"M16.4805 0C19.2192 0.000148464 21.4403 2.22119 21.4404 4.95996C21.4404 7.69884 19.2193 9.91977 16.4805 9.91992C12.8578 9.91992 9.91992 12.8578 9.91992 16.4805C9.91977 19.2193 7.69884 21.4404 4.95996 21.4404C2.22119 21.4403 0.000148466 19.2192 0 16.4805C0 13.7416 2.2211 11.5206 4.95996 11.5205C8.58259 11.5205 11.5205 8.58259 11.5205 4.95996C11.5206 2.2211 13.7416 0 16.4805 0ZM16.5098 11.5C19.249 11.5 21.4695 13.7208 21.4697 16.46C21.4697 19.1993 19.2491 21.4199 16.5098 21.4199C13.7705 21.4198 11.5498 19.1992 11.5498 16.46C11.55 13.7209 13.7707 11.5001 16.5098 11.5ZM4.95996 0C7.69922 0 9.9198 2.22074 9.91992 4.95996C9.91992 7.69929 7.69929 9.91992 4.95996 9.91992C2.22074 9.9198 0 7.69922 0 4.95996C0.000126519 2.22081 2.22081 0.000126521 4.95996 0Z\"/></svg>",
+  openrouter: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>OpenRouter</title><path d=\"M18.654 3.87a5.087 5.087 0 110 10.174L23.7 19.09c.64.641.187 1.737-.72 1.737H8.48a8.479 8.479 0 010-16.958h10.175zM8.479 7.26a5.087 5.087 0 100 10.176 5.087 5.087 0 000-10.175z\"></path></svg>",
+  groq: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Groq</title><path d=\"M12.036 2c-3.853-.035-7 3-7.036 6.781-.035 3.782 3.055 6.872 6.908 6.907h2.42v-2.566h-2.292c-2.407.028-4.38-1.866-4.408-4.23-.029-2.362 1.901-4.298 4.308-4.326h.1c2.407 0 4.358 1.915 4.365 4.278v6.305c0 2.342-1.944 4.25-4.323 4.279a4.375 4.375 0 01-3.033-1.252l-1.851 1.818A7 7 0 0012.029 22h.092c3.803-.056 6.858-3.083 6.879-6.816v-6.5C18.907 4.963 15.817 2 12.036 2z\"></path></svg>",
+  cerebras: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Cerebras</title><path clip-rule=\"evenodd\" d=\"M14.121 2.701a9.299 9.299 0 000 18.598V22.7c-5.91 0-10.7-4.791-10.7-10.701S8.21 1.299 14.12 1.299V2.7zm4.752 3.677A7.353 7.353 0 109.42 17.643l-.901 1.074a8.754 8.754 0 01-1.08-12.334 8.755 8.755 0 0112.335-1.08l-.901 1.075zm-2.255.844a5.407 5.407 0 00-5.048 9.563l-.656 1.24a6.81 6.81 0 016.358-12.043l-.654 1.24zM14.12 8.539a3.46 3.46 0 100 6.922v1.402a4.863 4.863 0 010-9.726v1.402z\"></path><path d=\"M15.407 10.836a2.24 2.24 0 00-.51-.409 1.084 1.084 0 00-.544-.152c-.255 0-.483.047-.684.14a1.58 1.58 0 00-.84.912c-.074.203-.11.416-.11.631 0 .218.036.43.11.631a1.594 1.594 0 00.84.913c.2.093.43.14.684.14.216 0 .417-.046.602-.135.188-.09.35-.225.475-.392l.928 1.006c-.14.14-.3.261-.482.363a3.367 3.367 0 01-1.083.38c-.17.026-.317.04-.44.04a3.315 3.315 0 01-1.182-.21 2.825 2.825 0 01-.961-.597 2.816 2.816 0 01-.644-.929 2.987 2.987 0 01-.238-1.21c0-.444.08-.847.238-1.21.15-.35.368-.666.643-.929.278-.261.605-.464.962-.596a3.315 3.315 0 011.182-.21c.355 0 .712.068 1.072.204.361.138.685.36.944.649l-.962.97z\"></path></svg>",
+  mistral: "<svg fill=\"#FA520F\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Mistral</title><path clip-rule=\"evenodd\" d=\"M3.428 3.4h3.429v3.428h3.429v3.429h-.002 3.431V6.828h3.427V3.4h3.43v13.714H24v3.429H13.714v-3.428h-3.428v-3.429h-3.43v3.428h3.43v3.429H0v-3.429h3.428V3.4zm10.286 13.715h3.428v-3.429h-3.427v3.429z\"></path></svg>",
+  gemini: "<svg fill=\"url(#lp-gemini)\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Gemini</title><path d=\"M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z\"></path><defs><linearGradient id=\"lp-gemini\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0%\" stop-color=\"#4285F4\"/><stop offset=\"50%\" stop-color=\"#9B72CB\"/><stop offset=\"100%\" stop-color=\"#D96570\"/></linearGradient></defs></svg>",
+  sambanova: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>SambaNova</title><path d=\"M23 23h-1.223V8.028c0-3.118-2.568-5.806-5.744-5.806H8.027c-3.176 0-5.744 2.565-5.744 5.686 0 3.119 2.568 5.684 5.744 5.684h.794c1.346 0 2.445 1.1 2.445 2.444 0 1.346-1.1 2.446-2.445 2.446H1v-1.223h7.761c.671 0 1.223-.551 1.223-1.16 0-.67-.552-1.16-1.223-1.16h-.794C4.177 14.872 1 11.756 1 7.909 1 4.058 4.176 1 8.027 1h8.066C19.88 1 23 4.239 23 8.028V23z\"></path><path d=\"M8.884 12.672c1.71.06 3.361 1.588 3.361 3.422 0 1.833-1.528 3.421-3.421 3.421H1v1.223h7.761c2.568 0 4.705-2.077 4.705-4.644 0-.672-.123-1.283-.43-1.894-.245-.551-.67-1.1-1.099-1.528-.489-.429-1.039-.734-1.65-.977-.525-.175-1.048-.193-1.594-.212-.218-.008-.441-.016-.669-.034-.428 0-1.406-.245-1.956-.61a3.369 3.369 0 01-1.223-1.406c-.183-.489-.305-.977-.305-1.528A3.417 3.417 0 017.96 4.482h8.066c1.895 0 3.422 1.65 3.422 3.483v15.032h1.223V8.027c0-2.568-2.077-4.768-4.645-4.768h-8c-2.568 0-4.705 2.077-4.705 4.646 0 .67.123 1.282.43 1.894a4.45 4.45 0 001.099 1.528c.429.428 1.039.734 1.588.976.306.123.611.183.976.246.857.06 1.406.123 1.466.123h.003z\"></path><path d=\"M1 23h7.761v-.003c3.85 0 7.03-3.116 7.09-7.026 0-3.79-3.117-6.906-6.967-6.906H8.09c-.672 0-1.222-.552-1.222-1.16 0-.608.487-1.16 1.159-1.16h8.069c.608 0 1.159.611 1.159 1.283v14.97h1.223V8.024c0-1.345-1.1-2.505-2.445-2.505H7.967a2.451 2.451 0 00-2.445 2.445 2.45 2.45 0 002.445 2.445h.794c3.176 0 5.744 2.568 5.744 5.684s-2.568 5.684-5.744 5.684H1V23z\"></path></svg>",
+  nvidia: "<svg fill=\"#76B900\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Nvidia</title><path d=\"M10.212 8.976V7.62c.127-.01.256-.017.388-.021 3.596-.117 5.957 3.184 5.957 3.184s-2.548 3.647-5.282 3.647a3.227 3.227 0 01-1.063-.175v-4.109c1.4.174 1.681.812 2.523 2.258l1.873-1.627a4.905 4.905 0 00-3.67-1.846 6.594 6.594 0 00-.729.044m0-4.476v2.025c.13-.01.259-.019.388-.024 5.002-.174 8.261 4.226 8.261 4.226s-3.743 4.69-7.643 4.69c-.338 0-.675-.031-1.007-.092v1.25c.278.038.558.057.838.057 3.629 0 6.253-1.91 8.794-4.169.421.347 2.146 1.193 2.501 1.564-2.416 2.083-8.048 3.763-11.24 3.763-.308 0-.603-.02-.894-.048V19.5H24v-15H10.21zm0 9.756v1.068c-3.356-.616-4.287-4.21-4.287-4.21a7.173 7.173 0 014.287-2.138v1.172h-.005a3.182 3.182 0 00-2.502 1.178s.615 2.276 2.507 2.931m-5.961-3.3c1.436-1.935 3.604-3.148 5.961-3.336V6.523C5.81 6.887 2 10.723 2 10.723s2.158 6.427 8.21 7.015v-1.166C5.77 16 4.25 10.958 4.25 10.958h-.002z\"></path></svg>",
+  deepinfra: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>DeepInfra</title><path d=\"M3.294 7.821A2.297 2.297 0 011 5.527a2.297 2.297 0 012.294-2.295A2.297 2.297 0 015.59 5.527 2.297 2.297 0 013.294 7.82zm0-3.688a1.396 1.396 0 000 2.79 1.396 1.396 0 000-2.79zM3.294 14.293A2.297 2.297 0 011 11.998a2.297 2.297 0 012.294-2.294 2.297 2.297 0 012.295 2.294 2.297 2.297 0 01-2.295 2.295zm0-3.688a1.395 1.395 0 000 2.788 1.395 1.395 0 100-2.788zM3.294 20.761A2.297 2.297 0 011 18.467a2.297 2.297 0 012.294-2.295 2.297 2.297 0 012.295 2.295 2.297 2.297 0 01-2.295 2.294zm0-3.688a1.396 1.396 0 000 2.79 1.396 1.396 0 000-2.79zM20.738 7.821a2.297 2.297 0 01-2.295-2.294 2.297 2.297 0 012.294-2.295 2.297 2.297 0 012.295 2.295 2.297 2.297 0 01-2.294 2.294zm0-3.688a1.396 1.396 0 101.395 1.395c0-.77-.626-1.395-1.395-1.395zM20.738 14.293a2.297 2.297 0 01-2.295-2.295 2.297 2.297 0 012.294-2.294 2.297 2.297 0 012.295 2.294 2.297 2.297 0 01-2.294 2.295zm0-3.688c-.769 0-1.395.625-1.395 1.393a1.396 1.396 0 002.79 0c0-.77-.626-1.393-1.395-1.393zM20.738 20.761a2.297 2.297 0 01-2.295-2.294 2.297 2.297 0 012.294-2.295 2.297 2.297 0 012.295 2.295 2.297 2.297 0 01-2.294 2.294zm0-3.688a1.396 1.396 0 101.395 1.395c0-.77-.626-1.395-1.395-1.395zM12.016 11.057a2.297 2.297 0 01-2.294-2.294 2.297 2.297 0 012.294-2.295 2.297 2.297 0 012.295 2.295 2.297 2.297 0 01-2.295 2.294zm0-3.688a1.396 1.396 0 101.395 1.395c0-.77-.625-1.395-1.395-1.395zM12.017 4.589a2.297 2.297 0 01-2.295-2.295A2.297 2.297 0 0112.017 0a2.297 2.297 0 012.294 2.294 2.297 2.297 0 01-2.294 2.295zm0-3.688a1.396 1.396 0 101.395 1.395c0-.77-.626-1.395-1.395-1.395zM12.017 17.529a2.297 2.297 0 01-2.295-2.295 2.297 2.297 0 012.295-2.294 2.297 2.297 0 012.294 2.294 2.297 2.297 0 01-2.294 2.295zm0-3.688a1.396 1.396 0 101.395 1.395c0-.77-.626-1.395-1.395-1.395zM12.016 24a2.297 2.297 0 01-2.294-2.295 2.297 2.297 0 012.294-2.294 2.297 2.297 0 012.295 2.294A2.297 2.297 0 0112.016 24zm0-3.688a1.396 1.396 0 101.395 1.395c0-.77-.625-1.395-1.395-1.395z\"></path><path d=\"M8.363 8.222a.742.742 0 01-.277-.053l-1.494-.596a.75.75 0 11.557-1.392l1.493.595a.75.75 0 01-.278 1.446h-.001zM8.363 14.566a.743.743 0 01-.277-.053l-1.494-.595a.75.75 0 11.557-1.393l1.493.596a.75.75 0 01-.278 1.445h-.001zM17.124 11.397a.741.741 0 01-.277-.054l-1.493-.595a.75.75 0 11.555-1.392l1.493.595a.75.75 0 01-.278 1.446zM17.124 5.05a.744.744 0 01-.277-.054L15.354 4.4a.75.75 0 01.555-1.392l1.493.596a.75.75 0 01-.278 1.445zM17.124 17.739a.743.743 0 01-.277-.053l-1.494-.596a.75.75 0 11.556-1.392l1.493.596a.75.75 0 01-.278 1.445zM6.91 17.966a.75.75 0 01-.279-1.445l1.494-.595a.749.749 0 11.556 1.392l-1.493.595a.743.743 0 01-.277.053H6.91zM6.91 11.66a.75.75 0 01-.279-1.446l1.494-.595a.75.75 0 01.556 1.392l-1.493.595a.743.743 0 01-.277.053H6.91zM6.91 5.033a.75.75 0 01-.279-1.446l1.494-.595a.75.75 0 01.556 1.392l-1.493.596a.744.744 0 01-.277.053H6.91zM8.363 21.364a.743.743 0 01-.277-.053l-1.494-.596a.75.75 0 01.555-1.392l1.494.595a.75.75 0 01-.278 1.446zM15.63 8.223a.75.75 0 01-.278-1.447l1.494-.595a.75.75 0 01.556 1.393l-1.494.595a.744.744 0 01-.276.054h-.002zM15.63 14.567a.75.75 0 01-.278-1.446l1.494-.596a.75.75 0 01.556 1.394l-1.494.595a.743.743 0 01-.276.053h-.002zM15.63 21.363a.749.749 0 01-.278-1.445l1.494-.595a.75.75 0 11.555 1.392l-1.494.595a.741.741 0 01-.277.053z\"></path></svg>",
+  modelscope: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>ModelScope</title><path d=\"M2.667 5.3H8v2.667H5.333v2.666H2.667V8.467H.5v2.166h2.167V13.3H0V7.967h2.667V5.3zM2.667 13.3h2.666v2.667H8v2.666H2.667V13.3zM8 10.633h2.667V13.3H8v-2.667zM13.333 13.3v2.667h-2.666V13.3h2.666zM13.333 13.3v-2.667H16V13.3h-2.667z\"></path><path clip-rule=\"evenodd\" d=\"M21.333 13.3v-2.667h-2.666V7.967H16V5.3h5.333v2.667H24V13.3h-2.667zm0-2.667H23.5V8.467h-2.167v2.166z\"></path><path d=\"M21.333 13.3v5.333H16v-2.666h2.667V13.3h2.666z\"></path></svg>",
+  novita: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>Novita AI</title><path clip-rule=\"evenodd\" d=\"M9.167 4.17v5.665L0 19.003h9.167v-5.666l5.666 5.666H24L9.167 4.17z\"></path></svg>",
+  together: "<svg fill=\"currentColor\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>together.ai</title><path d=\"M23.197 4.503A6 6 0 0015 2.307a5.973 5.973 0 00-2.995 4.933l5.996.008v.515h-5.996c.039.937.298 1.87.8 2.74a6 6 0 1010.39-6z\"></path><path d=\"M.805 4.5A6 6 0 003 12.697a5.972 5.972 0 005.77.127L5.779 7.627l.446-.257 2.997 5.192A6 6 0 10.804 4.5z\"></path><path d=\"M12 23.894a6 6 0 005.999-6c0-2.13-1.1-3.996-2.775-5.06l-3.005 5.189-.444-.258 2.997-5.192A6 6 0 1012 23.894z\"></path></svg>",
+  deepseek: "<svg fill=\"#4D6BFE\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><title>DeepSeek</title><path d=\"M23.748 4.482c-.254-.124-.364.113-.512.234-.051.039-.094.09-.137.136-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.156-.708-.311-.955-.65-.172-.241-.219-.51-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.093.172.187.129.323-.082.28-.18.552-.266.833-.055.179-.137.217-.329.14a5.526 5.526 0 01-1.736-1.18c-.857-.828-1.631-1.742-2.597-2.458a11.365 11.365 0 00-.689-.471c-.985-.957.13-1.743.388-1.836.27-.098.093-.432-.779-.428-.872.004-1.67.295-2.687.684a3.055 3.055 0 01-.465.137 9.597 9.597 0 00-2.883-.102c-1.885.21-3.39 1.102-4.497 2.623C.082 8.606-.231 10.684.152 12.85c.403 2.284 1.569 4.175 3.36 5.653 1.858 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.133-.284 4.994-1.86.47.234.962.327 1.78.397.63.059 1.236-.03 1.705-.128.735-.156.684-.837.419-.961-2.155-1.004-1.682-.595-2.113-.926 1.096-1.296 2.746-2.642 3.392-7.003.05-.347.007-.565 0-.845-.004-.17.035-.237.23-.256a4.173 4.173 0 001.545-.475c1.396-.763 1.96-2.015 2.093-3.517.02-.23-.004-.467-.247-.588zM11.581 18c-2.089-1.642-3.102-2.183-3.52-2.16-.392.024-.321.471-.235.763.09.288.207.486.371.739.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.167-1.361-.802-2.5-1.86-3.301-3.307-.774-1.393-1.224-2.887-1.298-4.482-.02-.386.093-.522.477-.592a4.696 4.696 0 011.529-.039c2.132.312 3.946 1.265 5.468 2.774.868.86 1.525 1.887 2.202 2.891.72 1.066 1.494 2.082 2.48 2.914.348.292.625.514.891.677-.802.09-2.14.11-3.054-.614zm1-6.44a.306.306 0 01.415-.287.302.302 0 01.2.288.306.306 0 01-.31.307.303.303 0 01-.304-.308zm3.11 1.596c-.2.081-.399.151-.59.16a1.245 1.245 0 01-.798-.254c-.274-.23-.47-.358-.552-.758a1.73 1.73 0 01.016-.588c.07-.327-.008-.537-.239-.727-.187-.156-.426-.199-.688-.199a.559.559 0 01-.254-.078c-.11-.054-.2-.19-.114-.358.028-.054.16-.186.192-.21.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.391.451.462.576.685.914.176.265.336.537.445.848.067.195-.019.354-.25.452z\"></path></svg>",
   pollinations: `<img src="data:image/png;base64,${POLLINATIONS_PNG}" alt="">`,
   qoder: `<img src="data:image/png;base64,${QODER_PNG}" alt="">`,
 };
@@ -582,6 +617,237 @@ const REAL_PROVIDERS: ProviderDef[] = [
     ],
   },
   {
+    id: "openrouter",
+    label: "OpenRouter",
+    color: "#94a3b8",
+    logo: MARKS.openrouter ?? null,
+    monogram: "O",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://openrouter.ai/settings/keys",
+    hint: "One key for hundreds of models. The ids ending in :free need no credit; everything else bills per token. Create a key at openrouter.ai/settings/keys.",
+    inference: { baseUrl: "https://openrouter.ai/api/v1", format: "openai" },
+    models: [
+      { id: "google/gemma-4-31b-it:free", label: "Gemma 4 31B (free)" },
+      { id: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron 3 Ultra 550B (free)" },
+      { id: "nvidia/nemotron-3.5-lightning:free", label: "Nemotron 3.5 Lightning (free)" },
+      { id: "cohere/north-mini-code:free", label: "North Mini Code (free)" },
+      { id: "inclusionai/ling-3.2-flash:free", label: "Ling 3.2 Flash (free)" },
+    ],
+  },
+  {
+    id: "groq",
+    label: "Groq",
+    color: "#f55036",
+    logo: MARKS.groq ?? null,
+    monogram: "G",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://console.groq.com/keys",
+    hint: "LPU inference, very low latency. Create a key at console.groq.com/keys.",
+    inference: { baseUrl: "https://api.groq.com/openai/v1", format: "openai" },
+    models: [
+      { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
+      { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B" },
+      { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant" },
+      { id: "qwen/qwen3.8-27b", label: "Qwen3.8 27B" },
+    ],
+  },
+  {
+    id: "cerebras",
+    label: "Cerebras",
+    color: "#c8102e",
+    logo: MARKS.cerebras ?? null,
+    monogram: "C",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://cloud.cerebras.ai/",
+    hint: "Wafer-scale inference, very low latency. Create a key in cloud.cerebras.ai under API Keys.",
+    inference: { baseUrl: "https://api.cerebras.ai/v1", format: "openai" },
+    models: [
+      { id: "gpt-oss-120b", label: "GPT-OSS 120B" },
+      { id: "qwen-3.8-27b", label: "Qwen3.8 27B" },
+    ],
+  },
+  {
+    id: "mistral",
+    label: "Mistral",
+    color: "#fa520f",
+    logo: MARKS.mistral ?? null,
+    monogram: "M",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://console.mistral.ai/api-keys",
+    hint: "La Plateforme, the Mistral API. Create a key at console.mistral.ai/api-keys.",
+    inference: { baseUrl: "https://api.mistral.ai/v1", format: "openai" },
+    models: [
+      { id: "mistral-large-2512", label: "Mistral Large 2512" },
+      { id: "mistral-medium-3-5", label: "Mistral Medium 3.5" },
+      { id: "mistral-small-2506", label: "Mistral Small 2506" },
+      { id: "magistral-medium-2509", label: "Magistral Medium 2509" },
+      { id: "devstral-2512", label: "Devstral 2512" },
+    ],
+  },
+  {
+    id: "google-ai-studio",
+    label: "Google AI Studio",
+    color: "#4285f4",
+    logo: MARKS.gemini ?? null,
+    monogram: "G",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://aistudio.google.com/apikey",
+    hint: "The Gemini API with an AI Studio key, not a Google account login. Create one at aistudio.google.com/apikey.",
+    inference: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", format: "openai" },
+    models: [
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
+      { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash Lite" },
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+    ],
+  },
+  {
+    id: "sambanova",
+    label: "SambaNova",
+    color: "#ee3124",
+    logo: MARKS.sambanova ?? null,
+    monogram: "S",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://cloud.sambanova.ai/apis",
+    hint: "RDU inference, very low latency. Create a key in cloud.sambanova.ai under APIs.",
+    inference: { baseUrl: "https://api.sambanova.ai/v1", format: "openai" },
+    models: [
+      { id: "gpt-oss-120b", label: "GPT-OSS 120B" },
+      { id: "GLM-5.3", label: "GLM 5.3" },
+      { id: "Meta-Llama-3.3-70B-Instruct", label: "Llama 3.3 70B" },
+      { id: "MiniMax-M3.1-Flash", label: "MiniMax M3.1 Flash" },
+    ],
+  },
+  {
+    id: "nvidia-nim",
+    label: "NVIDIA NIM",
+    color: "#76b900",
+    logo: MARKS.nvidia ?? null,
+    monogram: "N",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://build.nvidia.com/",
+    hint: "Hosted NIM endpoints. Open any model page on build.nvidia.com and use Get API Key.",
+    inference: { baseUrl: "https://integrate.api.nvidia.com/v1", format: "openai" },
+    models: [
+      { id: "nvidia/nemotron-3-ultra-550b-a55b", label: "Nemotron 3 Ultra 550B" },
+      { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B" },
+      { id: "google/gemma-4-31b-it", label: "Gemma 4 31B" },
+      { id: "z-ai/glm-5.3-flash", label: "GLM 5.3 Flash" },
+      { id: "minimaxai/minimax-m3.1-flash", label: "MiniMax M3.1 Flash" },
+    ],
+  },
+  {
+    id: "deepinfra",
+    label: "DeepInfra",
+    color: "#3b82f6",
+    logo: MARKS.deepinfra ?? null,
+    monogram: "D",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://deepinfra.com/dash/keys",
+    hint: "Open models billed per token, no subscription. Create a key at deepinfra.com/dash/keys.",
+    inference: { baseUrl: "https://api.deepinfra.com/v1/openai", format: "openai" },
+    models: [
+      { id: "deepseek-ai/DeepSeek-V4.1-Flash", label: "DeepSeek V4.1 Flash" },
+      { id: "Qwen/Qwen3.5-397B-A17B", label: "Qwen3.5 397B A17B" },
+      { id: "zai-org/GLM-5.3", label: "GLM 5.3" },
+      { id: "moonshotai/Kimi-K3.1-Pro", label: "Kimi K3.1 Pro" },
+      { id: "google/gemini-3.5-flash", label: "Gemini 3.5 Flash" },
+    ],
+  },
+  {
+    id: "modelscope",
+    label: "ModelScope",
+    color: "#624aff",
+    logo: MARKS.modelscope ?? null,
+    monogram: "M",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://modelscope.cn/my/myaccesstoken",
+    hint: "Alibaba's model hub inference API. Copy the access token from modelscope.cn/my/myaccesstoken.",
+    inference: { baseUrl: "https://api-inference.modelscope.cn/v1", format: "openai" },
+    models: [
+      { id: "Qwen/Qwen3.8-27B", label: "Qwen3.8 27B" },
+      { id: "deepseek-ai/DeepSeek-V4.1-Flash", label: "DeepSeek V4.1 Flash" },
+      { id: "moonshotai/Kimi-K3.1-Pro", label: "Kimi K3.1 Pro" },
+      { id: "ZhipuAI/GLM-5.2", label: "GLM 5.2" },
+      { id: "MiniMax/MiniMax-M3", label: "MiniMax M3" },
+    ],
+  },
+  {
+    id: "novita",
+    label: "Novita AI",
+    color: "#6d5cff",
+    logo: MARKS.novita ?? null,
+    monogram: "N",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://novita.ai/settings/key-management",
+    hint: "Open models billed per token. Create a key at novita.ai/settings/key-management.",
+    inference: { baseUrl: "https://api.novita.ai/v3/openai", format: "openai" },
+    models: [
+      { id: "qwen/qwen3.8-flash", label: "Qwen3.8 Flash" },
+      { id: "moonshotai/kimi-k3.1-pro", label: "Kimi K3.1 Pro" },
+      { id: "deepseek/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash" },
+      { id: "zai-org/glm-5.3", label: "GLM 5.3" },
+      { id: "minimax/minimax-m3.1-flash", label: "MiniMax M3.1 Flash" },
+    ],
+  },
+  {
+    id: "together",
+    label: "Together AI",
+    color: "#0f6fff",
+    logo: MARKS.together ?? null,
+    monogram: "T",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://api.together.xyz/settings/api-keys",
+    hint: "Open models billed per token. Create a key at api.together.xyz/settings/api-keys.",
+    inference: { baseUrl: "https://api.together.xyz/v1", format: "openai" },
+    models: [
+      { id: "deepseek-ai/DeepSeek-V4.1-Flash", label: "DeepSeek V4.1 Flash" },
+      { id: "moonshotai/Kimi-K3.1-Pro", label: "Kimi K3.1 Pro" },
+      { id: "Qwen/Qwen3.8-Flash", label: "Qwen3.8 Flash" },
+      { id: "zai-org/GLM-5.3", label: "GLM 5.3" },
+      { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
+    ],
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    color: "#4d6bfe",
+    logo: MARKS.deepseek ?? null,
+    monogram: "D",
+    login: "paste",
+    trust: "official",
+    group: "API key",
+    site: "https://platform.deepseek.com/api_keys",
+    hint: "DeepSeek's own API, billed per token. Create a key at platform.deepseek.com/api_keys. deepseek-flash is the current name for the V4.1 Flash model.",
+    inference: { baseUrl: "https://api.deepseek.com/v1", format: "openai" },
+    models: [
+      { id: "deepseek-flash", label: "DeepSeek Flash" },
+      { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
+    ],
+  },
+  {
     id: "pollinations",
     label: "Pollinations (keyless)",
     color: "#ff5ac8",
@@ -961,6 +1227,10 @@ interface PasteSession {
 
 type LoginSession = DeviceSession | PasteSession;
 
+/** These two paste flows hold a PKCE verifier in the closure /api/connect built, so
+ *  their session cannot be reconstructed by a later request in another process. */
+const STATEFUL_PASTE = new Set(["gitlab", "anthropic"]);
+
 async function startLogin(provider: ProviderDef): Promise<LoginSession> {
   // ---- device-code family -------------------------------------------------
   if (provider.login === "device") {
@@ -1246,6 +1516,23 @@ async function startLogin(provider: ProviderDef): Promise<LoginSession> {
         if (!value) throw new Error("nothing pasted");
         const res = await fetch("https://api.minimax.io/v1/models", { headers: { authorization: `Bearer ${value}` } });
         if (res.status === 401) throw new Error("MiniMax rejected this key (401)");
+        return toToken(provider.id, { access_token: value })!;
+      },
+    };
+  }
+  // Every platform-key provider speaks the OpenAI wire and publishes /models, so one
+  // branch covers them all. Checking the key there turns a bad paste into an error now
+  // rather than a silent fallback on the first chat. A catalog that stays public whatever
+  // the key (DeepInfra) or is missing (Google's OpenAI shim) simply skips the check.
+  if (provider.group === "API key") {
+    return {
+      kind: "paste",
+      url: provider.site ?? provider.inference.baseUrl,
+      finish: async (pasted) => {
+        const value = pasted.trim().replace(/^Bearer\s+/i, "");
+        if (!value) throw new Error("nothing pasted");
+        const res = await fetch(`${provider.inference.baseUrl}/models`, { headers: { authorization: `Bearer ${value}` } });
+        if (res.status === 401 || res.status === 403) throw new Error(`${provider.label} rejected this key (${res.status})`);
         return toToken(provider.id, { access_token: value })!;
       },
     };
@@ -3473,12 +3760,13 @@ const HTML = String.raw`<!doctype html>
 <body>
 <main>
   <h1>lazy<b>path</b></h1>
-  <div class="sub">One endpoint for every model. Logged in by account - no API keys to paste.</div>
+  <div class="sub">One endpoint for every model. Account logins, browser sessions and platform keys.</div>
+  <div class="card" id="faas" style="display:none;margin-bottom:6px;border-color:#7c5a12"></div>
 
   <div class="card row" style="margin-bottom:6px">
     <div class="grow"><div class="wait">Gateway key</div><code id="k"></code></div>
     <span class="kbd" onclick="copyKey()">copy</span>
-    <button class="ghost" onclick="act('rotate',{}).then(load)">rotate</button>
+    <button class="ghost" id="rot" onclick="act('rotate',{}).then(load)">rotate</button>
   </div>
 
   <h2>Usage</h2>
@@ -3523,6 +3811,7 @@ function visible(p){
   if(FILTER.chip==="ready")return p.connected&&!p.disabled;
   if(FILTER.chip==="risk")return p.trust==="tosrisk";
   if(FILTER.chip==="paste")return p.group==="Browser login";
+  if(FILTER.chip==="key")return p.group==="API key";
   return true;
 }
 function renderUsage(){
@@ -3538,7 +3827,7 @@ function renderUsage(){
 }
 function renderChips(){
   var n=S.providers,conn=n.filter(function(p){return p.connected}).length;
-  var defs=[["all","Total "+n.length,null],["connected","Connected "+conn,"var(--ok)"],["ready","Active "+n.filter(function(p){return p.connected&&!p.disabled}).length,"var(--acc)"],["paste","Browser login "+n.filter(function(p){return p.group==="Browser login"}).length,"#60a5fa"],["risk","ToS risk "+n.filter(function(p){return p.trust==="tosrisk"}).length,"var(--warn)"]];
+  var defs=[["all","Total "+n.length,null],["connected","Connected "+conn,"var(--ok)"],["ready","Active "+n.filter(function(p){return p.connected&&!p.disabled}).length,"var(--acc)"],["paste","Browser login "+n.filter(function(p){return p.group==="Browser login"}).length,"#60a5fa"],["key","API key "+n.filter(function(p){return p.group==="API key"}).length,"#a78bfa"],["risk","ToS risk "+n.filter(function(p){return p.trust==="tosrisk"}).length,"var(--warn)"]];
   document.getElementById("chips").innerHTML=defs.map(function(d){
     return '<span class="chip'+(FILTER.chip===d[0]?" sel":"")+'" onclick="FILTER.chip=\''+d[0]+'\';render()">'+(d[2]?'<i style="background:'+d[2]+'"></i>':'')+d[1]+'</span>'
   }).join("")
@@ -3560,6 +3849,12 @@ function card(p){
 function render(){
   renderChips();
   document.getElementById("k").textContent=S.gatewayKey;
+  var f=document.getElementById("faas");
+  if(S.serverless){
+    f.style.display="";
+    f.innerHTML='<div class="wait">Serverless mode: there is no durable disk here, so a connection you make on this page lasts only until the next cold start. Put it in the <code>LAZYPATH_TOKENS</code> env var to keep it. Device-code logins need a process that stays alive - link those locally with <code>node lazypath.ts</code>, then copy them over with <code>lazypath export</code>.</div>';
+    document.getElementById("rot").style.display="none";
+  }
   S._max=Math.max(1,S.providers.reduce(function(a,p){return Math.max(a,p.usage.requests)},0));
   document.getElementById("curl").textContent='curl '+S.baseUrl+'/v1/chat/completions \\\n  -H "Authorization: Bearer '+S.gatewayKey+'" \\\n  -H "content-type: application/json" \\\n  -d \'{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":true}\'';
   var groups={};
@@ -3683,6 +3978,7 @@ function summary(base: string) {
     gatewayKey: cfg.gatewayKey,
     presets: cfg.presets,
     baseUrl: base,
+    serverless: SERVERLESS,
     usage,
     providers: PROVIDERS.map((p) => {
       const t = tokens[p.id];
@@ -3721,7 +4017,8 @@ const VERSION = (() => {
   }
 })();
 
-const ARGS = process.argv.slice(2);
+// A FaaS runtime owns argv, and a stray flag there must not exit the function.
+const ARGS = SERVERLESS ? [] : process.argv.slice(2);
 const argValue = (name: string) => {
   const i = ARGS.findIndex((a) => a === `--${name}` || a === `-${name[0]}`);
   return i >= 0 ? ARGS[i + 1] : undefined;
@@ -3733,6 +4030,7 @@ const HELP = `lazypath ${VERSION} - one OpenAI endpoint for every LLM you can lo
   lazypath --port <n>     listen on another port
   lazypath --host <addr>  bind elsewhere: the token store is then reachable without TLS
   lazypath --no-open      do not touch the browser
+  lazypath export         print the token store as JSON for LAZYPATH_TOKENS (secrets!)
   lazypath --version      print the version
   lazypath help           this text
 
@@ -3744,6 +4042,10 @@ if (ARGS[0] === "help" || ARGS.includes("--help") || ARGS.includes("-h")) {
 }
 if (ARGS.includes("--version") || ARGS.includes("-v")) {
   console.log(VERSION);
+  process.exit(0);
+}
+if (ARGS[0] === "export") {
+  console.log(JSON.stringify(loadTokens()));
   process.exit(0);
 }
 const unknown = ARGS.find((a) => a.startsWith("-") && a !== "--no-open" && !["--port", "--host", "-p"].includes(a));
@@ -3770,11 +4072,31 @@ const PORT = Number(argValue("port") ?? process.env.PORT ?? loadConfig().port);
 // loopback by default: the token store is worth stealing and there is no TLS here
 const HOST = argValue("host") ?? process.env.HOST ?? "127.0.0.1";
 const OPEN = !ARGS.includes("--no-open") && process.env.LAZYPATH_NO_OPEN !== "1";
-
+/** On loopback nothing else can reach the dashboard, so it stays open. Anywhere else -
+ *  Vercel, or --host 0.0.0.0 - those same routes would let a stranger read your usage,
+ *  paste their own cookies, disconnect your providers or rotate your key. */
+const PUBLIC = SERVERLESS || !["127.0.0.1", "::1", "localhost"].includes(HOST);
 
 function json(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(value));
+}
+
+const KEY_GATE = String.raw`<!doctype html><meta charset="utf-8"><title>lazypath</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#05070b;color:#e6edf3;font:14px system-ui,sans-serif}
+form{display:flex;gap:8px;align-items:flex-end;padding:24px;border:1px solid #232c3d;border-radius:14px;background:#0b0f16}
+input{font:13px ui-monospace,Consolas,monospace;background:#05070b;border:1px solid #232c3d;color:#e6edf3;border-radius:8px;padding:9px 11px;width:280px}
+button{font:13px system-ui;background:#2f6f63;color:#fff;border:0;border-radius:8px;padding:9px 14px;cursor:pointer}
+p{margin:0 0 12px;color:#8b98a9;font-size:12px}</style>
+<form method="get" action="/"><div><p>This gateway is not on loopback. Enter its key to open the dashboard.</p>
+<input name="key" type="password" placeholder="lp-..." autofocus autocomplete="off"></div><button>Open</button></form>`;
+
+function authed(req: IncomingMessage): boolean {
+  if (!PUBLIC) return true;
+  const key = loadConfig().gatewayKey;
+  if ((req.headers.authorization ?? "") === `Bearer ${key}`) return true;
+  return cookieValue(req.headers.cookie ?? "", "lp_key") === key;
 }
 
 async function readBody(req: IncomingMessage) {
@@ -3783,7 +4105,9 @@ async function readBody(req: IncomingMessage) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-// localhost-only server with a bearer key: any page may call it, nothing is cookie-authed
+// Any page may call the OpenAI routes with a bearer key. The dashboard's cookie is not
+// reachable cross-origin: `*` here forbids credentialed requests, so only same-origin
+// fetches ride it.
 const CORS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
@@ -3794,7 +4118,7 @@ const CORS: Record<string, string> = {
 
 const handle = async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
-  const base = `http://${req.headers.host ?? `localhost:${PORT}`}`;
+  const base = `${SERVERLESS ? "https" : "http"}://${req.headers.host ?? `localhost:${PORT}`}`;
   for (const k in CORS) res.setHeader(k, CORS[k]);
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -3802,8 +4126,25 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
   }
   try {
     if (req.method === "GET" && url.pathname === "/") {
-      res.writeHead(200, { "content-type": "text/html" });
-      return res.end(HTML);
+      // The key-entry form GETs here. A correct key becomes an HttpOnly cookie so the
+      // dashboard's own same-origin fetches ride it without any client-side change.
+      const offered = url.searchParams.get("key");
+      if (offered !== null && offered === loadConfig().gatewayKey) {
+        res.writeHead(302, {
+          location: "/",
+          "set-cookie": `lp_key=${offered}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${SERVERLESS ? "; Secure" : ""}`,
+        });
+        return res.end();
+      }
+      if (authed(req)) {
+        res.writeHead(200, { "content-type": "text/html" });
+        return res.end(HTML);
+      }
+      res.writeHead(offered === null ? 200 : 401, { "content-type": "text/html" });
+      return res.end(KEY_GATE);
+    }
+    if (!authed(req) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models")) {
+      return json(res, 401, { error: { message: "bad lazypath key" } });
     }
     if (url.pathname === "/api/summary") return json(res, 200, summary(base));
 
@@ -3814,6 +4155,13 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       if (url.pathname === "/api/connect") {
         if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
         if (tokenStore()[provider.id]) return json(res, 200, { alreadyConnected: true });
+        if (SERVERLESS && (provider.login === "device" || STATEFUL_PASTE.has(provider.id))) {
+          return json(res, 400, {
+            error: {
+              message: `${provider.label} needs a login that stays alive between requests, which serverless does not give us. Connect it locally with "node lazypath.ts", then run "lazypath export" and put that JSON in the LAZYPATH_TOKENS env var.`,
+            },
+          });
+        }
         try {
           const session = await startLogin(provider);
           if (session.kind === "device") {
@@ -3828,8 +4176,9 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (url.pathname === "/api/finish") {
         let session = provider && pasteSessions.get(provider.id);
-        // Cookie logins have nothing to start: build the session on demand.
-        if (!session && provider?.login === "cookie") {
+        // Cookie logins have nothing to start, and on serverless the instance that ran
+        // /api/connect may already be gone: rebuild any session that holds no secret state.
+        if (!session && provider && (provider.login === "cookie" || provider.login === "paste") && !STATEFUL_PASTE.has(provider.id)) {
           session = (await startLogin(provider)) as PasteSession;
           pasteSessions.set(provider.id, session);
         }
@@ -3870,6 +4219,11 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 200, { ok: true });
       }
       if (url.pathname === "/api/rotate") {
+        // A rotated key would not survive the next cold start, and every app calling this
+        // gateway is configured with the env key - rotating here would just break them.
+        if (SERVERLESS) {
+          return json(res, 400, { error: { message: "the key comes from LAZYPATH_GATEWAY_KEY here; change it in the Vercel project settings and redeploy" } });
+        }
         const cfg = loadConfig();
         cfg.gatewayKey = `lp-${randomBytes(16).toString("hex")}`;
         saveConfig(cfg);
@@ -3983,37 +4337,51 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
   }
 };
 
-const server = createServer(handle);
+/** Vercel imports this file and calls the handler itself: there is no port to bind, no
+ *  browser to open, and no process that outlives the request. */
+export default handle;
 
-/** a second `lazypath` on the same port should not die with a stack trace */
-async function alreadyUp(): Promise<boolean> {
-  const probeHost = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
-  try {
-    return (await fetch(`http://${probeHost}:${PORT}/api/summary`, { signal: AbortSignal.timeout(1500) })).ok;
-  } catch {
-    return false;
-  }
+if (!SERVERLESS) {
+  const server = createServer(handle);
+  const dashboard = `http://localhost:${PORT}/`;
+
+  /** a second `lazypath` on the same port should not die with a stack trace */
+  const alreadyUp = async (): Promise<boolean> => {
+    const probeHost = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
+    try {
+      const r = await fetch(`http://${probeHost}:${PORT}/api/summary`, {
+        headers: { authorization: `Bearer ${loadConfig().gatewayKey}` },
+        signal: AbortSignal.timeout(1500),
+      });
+      return r.ok;
+    } catch {
+      return false;
+    }
+  };
+
+  // Chrome resolves `localhost` to ::1 first on Windows, so both loopbacks have to answer
+  if (HOST === "127.0.0.1") createServer(handle).on("error", () => {}).listen(PORT, "::1");
+  server.on("error", (e) => {
+    console.error(`lazypath: cannot listen on ${HOST}:${PORT} - ${(e as Error).message}`);
+    process.exit(1);
+  });
+
+  // No top-level await: a bundler that emits CommonJS for the serverless entry would
+  // reject it, and the CLI is the only caller that needs the probe.
+  void (async () => {
+    if (await alreadyUp()) {
+      console.log(`\n  lazypath is already running: ${dashboard}\n`);
+      if (OPEN) openBrowser(dashboard);
+      process.exit(0);
+    }
+    server.listen(PORT, HOST, () => {
+      console.log(`\n  lazypath v${VERSION} up on http://${HOST}:${PORT}`);
+      console.log(`  dashboard  ${dashboard}`);
+      console.log(`  openai api http://localhost:${PORT}/v1   (model: smart | fast | cheap)`);
+      console.log(`  key        ${loadConfig().gatewayKey}`);
+      console.log(`  data       ${DATA_DIR}\n`);
+      console.log(`  ctrl-c to stop\n`);
+      if (OPEN) openBrowser(dashboard);
+    });
+  })();
 }
-
-const dashboard = `http://localhost:${PORT}/`;
-if (await alreadyUp()) {
-  console.log(`\n  lazypath is already running: ${dashboard}\n`);
-  if (OPEN) openBrowser(dashboard);
-  process.exit(0);
-}
-
-// Chrome resolves `localhost` to ::1 first on Windows, so both loopbacks have to answer
-if (HOST === "127.0.0.1") createServer(handle).on("error", () => {}).listen(PORT, "::1");
-server.on("error", (e) => {
-  console.error(`lazypath: cannot listen on ${HOST}:${PORT} - ${(e as Error).message}`);
-  process.exit(1);
-});
-server.listen(PORT, HOST, () => {
-  console.log(`\n  lazypath v${VERSION} up on http://${HOST}:${PORT}`);
-  console.log(`  dashboard  ${dashboard}`);
-  console.log(`  openai api http://localhost:${PORT}/v1   (model: smart | fast | cheap)`);
-  console.log(`  key        ${loadConfig().gatewayKey}`);
-  console.log(`  data       ${DATA_DIR}\n`);
-  console.log(`  ctrl-c to stop\n`);
-  if (OPEN) openBrowser(dashboard);
-});

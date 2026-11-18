@@ -13,8 +13,8 @@
   "scripts": {
     "start": "node lazypath.ts",
     "dev": "node --watch lazypath.ts",
-    "test": "node test/e2e.mjs",
-    "typecheck": "tsc --noEmit lazypath.ts --target es2024 --module nodenext --moduleResolution nodenext --strict --skipLibCheck --types node"
+    "test": "node test/e2e.mjs && node test/serverless.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
