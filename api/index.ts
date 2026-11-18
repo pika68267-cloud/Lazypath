@@ -1,3 +1,4 @@
 // Vercel's entry point. The whole gateway stays in lazypath.ts so it is still one
-// copy-pasteable file; this only re-exports its Node request handler.
-export { default } from "../lazypath.ts";
+// copy-pasteable file; `npm run vercel-build` strips its types into lazypath.js next to it.
+// The specifier must stay .js: Vercel does not bundle, so a .ts import is never compiled.
+export { default } from "../lazypath.js";

@@ -114,9 +114,16 @@ The same single file runs as a serverless function. `api/index.ts` re-exports it
 handler and `vercel.json` routes every path to it, so the dashboard, the API and the OpenAI
 endpoint all live at your deployment URL.
 
+Vercel compiles each `api/` file on its own, never bundles, and only compiles TypeScript that
+lives *inside* `api/` — so the entry cannot import `../lazypath.ts` and expect it to load. The
+`vercel-build` script (`build-vercel.mjs`) uses Node's own `stripTypeScriptTypes` to emit
+`lazypath.js` next to the source, and the entry imports that. No bundler, no runtime dependency,
+still one source file. Vercel picks the script up by itself.
+
 1. Push this repo to GitHub.
-2. In Vercel, **Add New > Project** and import it. Framework preset **Other**, Node **24.x**.
-   There is no build step.
+2. In Vercel, **Add New > Project** and import it. Framework preset **Other**, no output
+   directory. `engines.node` is `>=24`, which overrides the version dropdown and maps to
+   Vercel's newest LTS — anything from 24.x up runs the gateway unchanged.
 3. Set the environment variables below, then deploy.
 
 | variable | what it is |
@@ -158,14 +165,16 @@ requests, so:
 ## Tests
 
 ```
-npm test          # 92 checks: every wire format, fallback, streaming, presets, usage, auth,
-                  # then the serverless mode (key gate, env-seeded store, refused logins)
+npm test          # 114 checks: every wire format, fallback, streaming, presets, usage, auth,
+                  # then serverless mode, then the artifact Vercel actually runs
 npm run typecheck
 ```
 
 `test/mock-provider.mjs` is a local stub; mock providers only load with `LAZYPATH_MOCKS=1`.
 `test/e2e.mjs` drives a real gateway on a port; `test/serverless.mjs` imports the handler with
 `VERCEL=1` and drives it with mock req/res, because in that mode there is no port to bind.
+`test/vercel-build.mjs` runs the build and drives `api/index.ts` → `lazypath.js`, so a `.ts`
+specifier or a config that throws at import time cannot reach the platform unnoticed.
 
 ## Honest caveats
 

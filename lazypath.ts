@@ -123,23 +123,24 @@ const DEFAULT_PRESETS: Presets = {
 };
 
 function loadConfig(): Config {
-  const stored = existsSync(CONFIG_FILE) ? (JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as Config) : envJson<Config>("LAZYPATH_CONFIG");
-  if (stored) {
+  const stored = readJson<Config | null>(CONFIG_FILE, null) ?? envJson<Config>("LAZYPATH_CONFIG");
+  if (stored && typeof stored === "object" && !Array.isArray(stored)) {
     const cfg = stored;
     if (!Array.isArray(cfg.disabled)) cfg.disabled = [];
     // a config written by an older build can name providers that no longer ship,
     // which would leave a preset resolving to an empty chain
     const known = new Set(PROVIDERS.map((p) => p.id));
-    cfg.presets ??= {} as Presets;
+    if (!cfg.presets || typeof cfg.presets !== "object") cfg.presets = {} as Presets;
     for (const name of Object.keys(DEFAULT_PRESETS) as (keyof Presets)[]) {
-      const kept = (cfg.presets[name] ?? []).filter((id) => known.has(id));
+      const listed = cfg.presets[name];
+      const kept = (Array.isArray(listed) ? listed : []).filter((id) => known.has(id));
       cfg.presets[name] = kept.length ? kept : DEFAULT_PRESETS[name];
     }
     cfg.deviceId ??= randomBytes(16).toString("hex");
     cfg.port ??= 8787;
     // the env key is what the caller's app is configured with, so it outranks any
     // key a warm instance happened to generate before the env var was set
-    if (process.env.LAZYPATH_GATEWAY_KEY) cfg.gatewayKey = process.env.LAZYPATH_GATEWAY_KEY;
+    cfg.gatewayKey = process.env.LAZYPATH_GATEWAY_KEY ?? cfg.gatewayKey ?? `lp-${randomBytes(16).toString("hex")}`;
     return cfg;
   }
   const cfg: Config = {
