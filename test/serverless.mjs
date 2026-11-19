@@ -140,10 +140,12 @@ try {
   check("all-model page client opens the all-model panel", allModelsPage.text().includes('if(MODEL_PAGE){') && allModelsPage.text().includes('document.getElementById("panel-models").hidden=false'));
   const providerModelsPage = await get("/model/groq", jar);
   check("provider model page renders its detail panel", providerModelsPage.status === 200 && providerModelsPage.text().includes('data-provider="groq"') && providerModelsPage.text().includes("Refresh models") && providerModelsPage.text().includes("Connection"));
+  const providerModelsApi = await get("/api/provider/groq", jar);
+  check("provider models API returns JSON for the Check models button", providerModelsApi.status === 200 && providerModelsApi.json().provider === "groq" && Array.isArray(providerModelsApi.json().models));
+  check("provider models API requires authentication", (await get("/api/provider/groq")).status === 401);
   const cloudSync = await post("/api/sync-provider", { provider: "okmock" }, bearer);
   check("cloud sync endpoint requires D1 configuration", cloudSync.status === 409);
-  const providerModelsApi = await get("/model/groq", jar);
-  check("provider model API returns provider catalog page", providerModelsApi.status === 200 && providerModelsApi.text().includes('data-provider="groq"'));
+  check("provider detail page remains available at its page URL", providerModelsPage.status === 200 && providerModelsPage.text().includes('data-provider="groq"'));
   check("unknown provider model page is not found", (await get("/model/no-such-provider", jar)).status === 404);
   const viaCookie = await summary(jar);
   check("cookie authenticates the api", viaCookie.serverless === true);

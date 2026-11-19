@@ -4437,7 +4437,7 @@ async function syncProviderToCloud(){
 async function checkProvider(){
   var status=document.getElementById("provider-status");status.textContent="Checking provider models...";
   try{
-    var r=await fetch("/model/"+encodeURIComponent(PAGE_PROVIDER)),j=await r.json();
+    var r=await fetch("/api/provider/"+encodeURIComponent(PAGE_PROVIDER)),j=await r.json();
     if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
     var provider=S&&S.providers.find(function(p){return p.id===PAGE_PROVIDER});
     if(!provider)throw new Error("Provider is no longer in the catalog");
@@ -5629,6 +5629,18 @@ async function route(req: IncomingMessage, res: ServerResponse) {
         return json(res, 200, { ok: true });
       }
       return json(res, 404, { error: { message: "not found" } });
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/api/provider/")) {
+      const providerId = url.pathname.slice("/api/provider/".length).split("/")[0];
+      const provider = providerById(providerId);
+      if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
+      return json(res, 200, {
+        provider: provider.id,
+        label: provider.label,
+        models: provider.models.map((m) => ({ id: m.id, label: m.label })),
+        connected: !!tokenStore()[provider.id],
+      });
     }
 
     if (url.pathname === "/v1/models") {
