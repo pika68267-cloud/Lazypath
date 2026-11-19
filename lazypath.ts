@@ -525,7 +525,6 @@ const REAL_PROVIDERS: ProviderDef[] = [
     },
     models: [
       { id: "gpt-6-astra", label: "GPT 6 Astra" },
-      { id: "gpt-6-astra-high", label: "GPT 6 Astra High" },
     ],
   },
   {
