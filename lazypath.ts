@@ -4159,10 +4159,10 @@ const HTML = String.raw`<!doctype html>
 
 <section id="panel-provider" hidden>
   <div class="provider-detail-head"><span id="provider-avatar"></span><div><h1 id="provider-title">Provider</h1><div class="sub" id="provider-description">Provider information and model catalog.</div></div></div>
-  <div class="mrow"><button class="ghost" onclick="location.href='/model'">← All providers</button><span class="provider-state" id="provider-state"><i></i><span id="provider-state-label">Checking status…</span></span></div>
+  <div class="mrow"><button class="ghost" onclick="location.href='/model'">← All providers</button><span class="provider-state" id="provider-state"><i></i><span id="provider-state-label">Checking status…</span></span><span class="provider-state" id="provider-sync-state"><i></i><span id="provider-sync-label">Cloud sync</span></span></div>
   <div class="provider-detail-grid">
     <div class="card"><div class="row"><h2 style="margin:0">Models</h2><button class="ghost" onclick="checkProvider()">Refresh models</button></div><div class="wait" id="provider-modelhint" style="margin-top:10px"></div><div id="provider-modellist" style="margin-top:8px"></div><div class="wait" id="provider-status" aria-live="polite"></div></div>
-    <div class="card"><h2>Connection</h2><div id="provider-connection"></div><div class="msec" id="provider-usage"></div></div>
+    <div class="card"><h2>Connection</h2><div id="provider-connection"></div><div class="msec" id="provider-usage"></div><div class="msec"><button class="ghost" onclick="syncProviderToCloud()">Sync local connection to cloud</button><div class="wait" id="provider-sync-status" aria-live="polite" style="margin-top:8px"></div></div></div>
   </div>
 </section>
 
@@ -4395,6 +4395,10 @@ function renderProviderDetail(p){
   document.getElementById("provider-description").textContent=p.group+" · "+(p.trust==="official"?"official integration":p.trust==="community"?"community integration":"web login");
   document.getElementById("provider-state").className="provider-state"+(p.connected?" connected":"");
   document.getElementById("provider-state-label").textContent=p.connected?"Connected":"Not connected";
+  document.getElementById("provider-sync-state").className="provider-state"+(S&&S.accountMode==="cloudflare"?" connected":"");
+  document.getElementById("provider-sync-label").textContent=S&&S.accountMode==="cloudflare"?"Cloud sync on":"Local only";
+  var syncButton=document.querySelector("#provider-connection~.msec button");
+  if(syncButton)syncButton.disabled=!(S&&S.accountMode==="cloudflare");
   document.getElementById("provider-usage").textContent=p.usage.requests+" requests · "+p.usage.ok+" successful · "+p.usage.failed+" failed";
   var connection=document.getElementById("provider-connection");
   if(p.connected){
@@ -4414,6 +4418,21 @@ async function finishProvider(id){
   if(!field)return;
   await act("finish",{provider:id,code:field.value});
   load(true);
+}
+async function syncProviderToCloud(){
+  var status=document.getElementById("provider-sync-status");
+  if(!S||S.accountMode!=="cloudflare"){
+    status.textContent="Cloud D1 is not configured for this local gateway. Set CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_D1_DATABASE_ID and CLOUDFLARE_API_TOKEN locally, then restart Lazypath.";
+    return;
+  }
+  status.textContent="Syncing local provider connection to Cloudflare D1…";
+  try{
+    var r=await fetch("/api/sync-provider",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({provider:PAGE_PROVIDER})});
+    var j=await r.json().catch(function(){return{}});
+    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+    status.textContent=j.synced?"Provider connection synced to Cloudflare D1.":"No local provider connection found to sync.";
+    load(true);
+  }catch(e){status.textContent="Sync failed: "+e.message;}
 }
 async function checkProvider(){
   var status=document.getElementById("provider-status");status.textContent="Checking provider models...";
@@ -5542,6 +5561,21 @@ async function route(req: IncomingMessage, res: ServerResponse) {
           return json(res, 200, { ok: true });
         } catch (e) {
           return json(res, 502, { error: { message: String(e) } });
+        }
+      }
+      if (url.pathname === "/api/sync-provider") {
+        if (!D1) return json(res, 409, { error: { message: "Cloudflare D1 is not configured on this local gateway. Configure CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_D1_DATABASE_ID and CLOUDFLARE_API_TOKEN first." } });
+        if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
+        const localToken = localTokens()[provider.id];
+        if (!localToken) return json(res, 404, { error: { message: "No locally saved connection for this provider." } });
+        try {
+          await d1Store();
+          await d1Query(TOKEN_UPSERT, [`token:${provider.id}`, JSON.stringify(localToken), Date.now()]);
+          await d1Query(TOKEN_UPSERT, [TOKENS_READY, "1", Date.now()]);
+          if (tokenCache) tokenCache[provider.id] = localToken;
+          return json(res, 200, { ok: true, synced: true, provider: provider.id });
+        } catch (e) {
+          return json(res, 502, { error: { message: `Could not sync provider connection to Cloudflare D1: ${String(e)}` } });
         }
       }
       if (url.pathname === "/api/disconnect") {
