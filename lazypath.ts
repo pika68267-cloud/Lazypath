@@ -526,7 +526,6 @@ const REAL_PROVIDERS: ProviderDef[] = [
     models: [
       { id: "gpt-6-astra", label: "GPT 6 Astra" },
       { id: "gpt-6-astra-high", label: "GPT 6 Astra High" },
-      { id: "gpt-5.6-sol", label: "GPT 5.6 Sol" },
     ],
   },
   {
@@ -3476,7 +3475,7 @@ async function dispatch(a: { provider: ProviderDef; model: string; token: string
     Object.assign(headers, {
       accept: "application/vnd.amazon.eventstream",
       "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-      "user-agent": "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+      "user-agent": "AWS-SDK-JS/3.0.0 kiro-ide/1.4.236",
     });
     const arn = loadTokens()[provider.id]?.headers?.["x-kiro-profile-arn"];
     return fetch(`${provider.inference.baseUrl}/generateAssistantResponse`, {
