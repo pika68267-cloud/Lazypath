@@ -509,24 +509,9 @@ const REAL_PROVIDERS: ProviderDef[] = [
       { id: "minimax-m3", label: "MiniMax M3" },
     ],
   },
-  {
-    id: "codex",
-    label: "ChatGPT (Codex)",
-    color: "#7a9dff",
-    logo: MARKS.codex ?? null,
-    monogram: "O",
-    login: "device",
-    trust: "official",
-    group: "Device code",
-    inference: {
-      baseUrl: "https://chatgpt.com/backend-api/codex",
-      format: "responses",
-      headers: { originator: "codex_cli_rs", version: "0.46.0" },
-    },
-    models: [
-      { id: "gpt-6-astra", label: "GPT 6 Astra" },
-    ],
-  },
+  // Codex (ChatGPT) removed - GPT-6 models return 400 model_not_found
+  // when using a ChatGPT account via Codex. The ChatGPT account doesn't support
+  // the gpt-6-astra or gpt-6-astra-high models.
   {
     id: "grok",
     label: "Grok (xAI)",
