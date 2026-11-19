@@ -5380,7 +5380,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       if (await authed(req)) return html(res, 200, HTML);
       return html(res, 200, homePage());
     }
-    if (req.method === "GET" && url.pathname !== "/" && url.pathname !== "/model" && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/v1/") && !url.pathname.startsWith("/signin") && !url.pathname.startsWith("/signup") && !url.pathname.startsWith("/signout")) {
+    if (req.method === "GET" && url.pathname !== "/" && url.pathname !== "/model" && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/v1/") && !url.pathname.startsWith("/signin") && !url.pathname.startsWith("/signup") && !url.pathname.startsWith("/signout") && url.pathname.indexOf(".")<0) {
       if (!(await authed(req))) {
         res.writeHead(302, { location: "/signin" });
         return res.end();
