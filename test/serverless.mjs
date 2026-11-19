@@ -115,7 +115,7 @@ try {
   check("Copilot device login can start on serverless with D1", copilotLogin.status === 200 && copilotLogin.json().kind === "device" && copilotLogin.json().polling === true, copilotLogin.text().slice(0, 140));
   const copilotStatus = await post("/api/login-status", { provider: "copilot" }, bearer);
   check("Copilot device login status is polled server-side", copilotStatus.status === 200 && typeof copilotStatus.json().pending === "boolean");
-  check("other serverless device flow is still refused", (await post("/api/connect", { provider: "kiro" }, bearer)).status === 400);
+  check("other serverless device flow is still refused", (await post("/api/connect", { provider: "tencent" }, bearer)).status === 400);
   check("disconnect needs a login", (await post("/api/disconnect", { provider: "okmock" })).status === 401);
 
   // ---- env-managed deployments do not offer sign-up ---------------------------

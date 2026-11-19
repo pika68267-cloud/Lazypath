@@ -324,6 +324,45 @@ async function flushTokens(): Promise<void> {
   await Promise.all(pending);
 }
 
+async function persistPendingDeviceLogin(pending: PendingDeviceLogin): Promise<void> {
+  if (!D1) throw new Error("Persistent device login requires Cloudflare D1.");
+  await d1Store();
+  await d1Query(TOKEN_UPSERT, [`${PENDING_DEVICE_PREFIX}${pending.provider}`, JSON.stringify(pending), Date.now()]);
+}
+
+async function readPendingDeviceLogin(provider: string): Promise<PendingDeviceLogin | null> {
+  if (!D1 || !["kiro", "codex", "grok"].includes(provider)) return null;
+  await d1Store();
+  const key = `${PENDING_DEVICE_PREFIX}${provider}`;
+  const row = await d1Query("SELECT json FROM store WHERE key = ?", [key]);
+  const raw = row.results?.[0]?.json;
+  if (typeof raw !== "string") return null;
+  try {
+    const pending = JSON.parse(raw) as PendingDeviceLogin;
+    const missingProviderState = pending.provider === "kiro"
+      ? !pending.clientSecret
+      : pending.provider === "codex"
+        ? !pending.authId || !pending.userCode
+        : pending.provider === "grok"
+          ? !pending.userCode
+          : true;
+    if (pending.provider !== provider || !pending.clientId || !pending.deviceCode || !pending.verifyUrl || !pending.startedAt || missingProviderState || Date.now() - pending.startedAt > 15 * 60_000) {
+      await d1Query("DELETE FROM store WHERE key = ?", [key]);
+      return null;
+    }
+    return pending;
+  } catch {
+    await d1Query("DELETE FROM store WHERE key = ?", [key]);
+    return null;
+  }
+}
+
+async function deletePendingDeviceLogin(provider: string): Promise<void> {
+  if (D1 && ["kiro", "codex", "grok"].includes(provider)) {
+    await d1Query("DELETE FROM store WHERE key = ?", [`${PENDING_DEVICE_PREFIX}${provider}`]);
+  }
+}
+
 const emptyRow = (): UsageRow => ({ requests: 0, ok: 0, failed: 0, inputTokens: 0, outputTokens: 0, lastUsedAt: 0 });
 
 function recordUsage(provider: string, ok: boolean, inputTokens: number, outputTokens: number) {
@@ -1377,13 +1416,94 @@ interface PasteSession {
 
 type LoginSession = DeviceSession | PasteSession;
 
+interface PendingDeviceLogin {
+  provider: "kiro" | "codex" | "grok";
+  clientId: string;
+  clientSecret?: string;
+  deviceCode: string;
+  authId?: string;
+  verifyUrl: string;
+  userCode: string;
+  startedAt: number;
+}
+
+const PENDING_DEVICE_PREFIX = "login:device:";
+
 /** These two paste flows hold a PKCE verifier in the closure /api/connect built, so
  *  their session cannot be reconstructed by a later request in another process. */
 const STATEFUL_PASTE = new Set(["gitlab", "anthropic"]);
 
+async function startPersistentDeviceLogin(providerId: PendingDeviceLogin["provider"]): Promise<PendingDeviceLogin> {
+  if (!D1) throw new Error("Cloudflare D1 must be configured for serverless device login.");
+  let pending: PendingDeviceLogin;
+  if (providerId === "kiro") {
+    const reg = await jsonPost("https://oidc.us-east-1.amazonaws.com/client/register", {
+      clientName: "lazypath", clientType: "public",
+      scopes: ["codewhisperer:completions", "codewhisperer:analysis", "codewhisperer:conversations"],
+      grantTypes: ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+    });
+    const clientId = String(reg.body.clientId ?? ""), clientSecret = String(reg.body.clientSecret ?? "");
+    if (!clientId) throw new Error(`kiro client registration failed: ${reg.text.slice(0, 160)}`);
+    const dev = await jsonPost("https://oidc.us-east-1.amazonaws.com/device_authorization", { clientId, clientSecret, startUrl: "https://view.awsapps.com/start" });
+    const data = dev.body as Record<string, string>;
+    if (!data.deviceCode) throw new Error(`kiro device start failed ${dev.status}: ${dev.text.slice(0, 160)}`);
+    pending = { provider: "kiro", clientId, clientSecret, deviceCode: data.deviceCode, verifyUrl: data.verificationUriComplete ?? data.verificationUri ?? "https://view.awsapps.com/start", userCode: String(data.userCode ?? ""), startedAt: Date.now() };
+  } else if (providerId === "codex") {
+    const c = CLIENTS.codex;
+    const response = await jsonPost(`${c.base}/api/accounts/deviceauth/usercode`, { client_id: c.clientId });
+    const authId = String(response.body.device_auth_id ?? ""), userCode = String(response.body.user_code ?? response.body.usercode ?? "");
+    if (!authId || !userCode) throw new Error(`codex device start failed ${response.status}: ${response.text.slice(0, 160)}`);
+    pending = { provider: "codex", clientId: c.clientId, deviceCode: authId, authId, verifyUrl: `${c.base}/codex/device`, userCode, startedAt: Date.now() };
+  } else {
+    const c = CLIENTS.grok, headers = { "x-grok-client-version": "0.2.106", "x-grok-client-surface": "cli" };
+    const response = await form(`${c.base}/oauth2/device/code`, { client_id: c.clientId, scope: c.scope, referrer: "grok-build" }, headers);
+    const data = response.body as Record<string, string>;
+    if (!response.ok || !data.device_code || !data.verification_uri) throw new Error(`grok device start failed ${response.status}: ${response.text.slice(0, 160)}`);
+    pending = { provider: "grok", clientId: c.clientId, deviceCode: data.device_code, verifyUrl: data.verification_uri_complete ?? data.verification_uri, userCode: data.user_code ?? "", startedAt: Date.now() };
+  }
+  await persistPendingDeviceLogin(pending);
+  return pending;
+}
+
+function createPersistentDeviceSession(pending: PendingDeviceLogin): DeviceSession {
+  if (pending.provider === "kiro") {
+    return { kind: "device", verifyUrl: pending.verifyUrl, userCode: pending.userCode, poll: async () => {
+      const response = await jsonPost("https://oidc.us-east-1.amazonaws.com/token", { clientId: pending.clientId, clientSecret: pending.clientSecret ?? "", deviceCode: pending.deviceCode, grantType: "urn:ietf:params:oauth:grant-type:device_code" });
+      if (!response.ok) return null;
+      const token = toToken("kiro", camelTokens(response.body), { "x-kiro-client-id": pending.clientId, "x-kiro-client-secret": pending.clientSecret ?? "" });
+      if (token) {
+        const arn = await kiroProfileArn(token.accessToken).catch(() => "");
+        if (arn) saveToken({ ...token, headers: { ...token.headers, "x-kiro-profile-arn": arn } });
+      }
+      return token;
+    } };
+  }
+  if (pending.provider === "codex") {
+    return { kind: "device", verifyUrl: pending.verifyUrl, userCode: pending.userCode, poll: async () => {
+      const c = CLIENTS.codex;
+      const response = await jsonPost(`${c.base}/api/accounts/deviceauth/token`, { device_auth_id: pending.authId ?? pending.deviceCode, user_code: pending.userCode });
+      if (!response.ok) return null;
+      const code = String(response.body.authorization_code ?? ""), verifier = String(response.body.code_verifier ?? "");
+      if (!code || !verifier) return null;
+      const exchanged = await form(`${c.base}/oauth/token`, { grant_type: "authorization_code", client_id: c.clientId, code, code_verifier: verifier, redirect_uri: `${c.base}/deviceauth/callback` });
+      if (!exchanged.ok) throw new Error(`codex token exchange failed ${exchanged.status}: ${exchanged.text.slice(0, 160)}`);
+      return toToken("codex", exchanged.body, codexAccountHeaders(String(exchanged.body.id_token ?? "")));
+    } };
+  }
+  return { kind: "device", verifyUrl: pending.verifyUrl, userCode: pending.userCode, poll: async () => {
+    const c = CLIENTS.grok;
+    const response = await form(`${c.base}/oauth2/token`, { grant_type: "urn:ietf:params:oauth:grant-type:device_code", client_id: pending.clientId, device_code: pending.deviceCode }, { "x-grok-client-version": "0.2.106", "x-grok-client-surface": "cli" });
+    return response.ok ? toToken("grok", response.body) : null;
+  } };
+}
+
 async function startLogin(provider: ProviderDef): Promise<LoginSession> {
   // ---- device-code family -------------------------------------------------
   if (provider.login === "device") {
+    if (SERVERLESS && D1 && ["kiro", "codex", "grok"].includes(provider.id)) {
+      const pending = await startPersistentDeviceLogin(provider.id as PendingDeviceLogin["provider"]);
+      return createPersistentDeviceSession(pending);
+    }
     if (provider.id.endsWith("mock")) {
       return startMockDevice(provider.id, "http://127.0.0.1:8788/oauth/device/code", "http://127.0.0.1:8788/oauth/device/token", provider.id);
     }
@@ -5565,7 +5685,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       if (url.pathname === "/api/connect") {
         if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
         if (tokenStore()[provider.id]) return json(res, 200, { alreadyConnected: true });
-        if (SERVERLESS && (STATEFUL_PASTE.has(provider.id) || (provider.login === "device" && provider.id !== "copilot"))) {
+        if (SERVERLESS && (STATEFUL_PASTE.has(provider.id) || (provider.login === "device" && !["copilot", "kiro", "codex", "grok"].includes(provider.id)))) {
           return json(res, 400, {
             error: {
               message: D1
@@ -5577,7 +5697,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
         try {
           const session = await startLogin(provider);
           if (session.kind === "device") {
-            if (SERVERLESS && provider.id === "copilot") {
+            if (SERVERLESS && ["copilot", "kiro", "codex", "grok"].includes(provider.id)) {
               activeLogins.set(provider.id, { session, startedAt: Date.now() });
               return json(res, 200, { kind: "device", verifyUrl: session.verifyUrl, userCode: session.userCode, polling: true });
             }
@@ -5610,7 +5730,18 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       }
       if (url.pathname === "/api/login-status") {
         if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
-        const login = activeLogins.get(provider.id);
+        let login = activeLogins.get(provider.id);
+        if (!login && SERVERLESS && ["kiro", "codex", "grok"].includes(provider.id)) {
+          try {
+            const pending = await readPendingDeviceLogin(provider.id);
+            if (pending) {
+              login = { session: createPersistentDeviceSession(pending), startedAt: pending.startedAt };
+              activeLogins.set(provider.id, login);
+            }
+          } catch (e) {
+            return json(res, 502, { error: { message: `Could not resume ${provider.label} login from Cloudflare D1: ${String(e)}` } });
+          }
+        }
         if (!login) return json(res, 200, { pending: false, connected: !!tokenStore()[provider.id] });
         if (login.session.kind !== "device") {
           activeLogins.delete(provider.id);
@@ -5627,12 +5758,14 @@ async function route(req: IncomingMessage, res: ServerResponse) {
             if (login.timer) clearInterval(login.timer);
             activeLogins.delete(provider.id);
             await flushTokens();
+            await deletePendingDeviceLogin(provider.id);
             return json(res, 200, { pending: false, connected: true });
           }
           return json(res, 200, { pending: true, connected: false });
         } catch (e) {
           if (login.timer) clearInterval(login.timer);
           activeLogins.delete(provider.id);
+          await deletePendingDeviceLogin(provider.id).catch(() => {});
           return json(res, 502, { error: { message: String(e) } });
         }
       }

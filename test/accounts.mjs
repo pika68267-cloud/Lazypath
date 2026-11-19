@@ -38,6 +38,7 @@ const d1 = createServer((req, res) => {
     queries.push(sql);
     const ok = (results, meta = {}) => send(200, { success: true, errors: [], result: [{ results, meta }] });
     if (sql.startsWith("CREATE TABLE")) return ok([]);
+    if (sql.startsWith("SELECT json FROM store WHERE key = ?")) return ok(store.has(params[0]) ? [{ json: store.get(params[0]) }] : []);
     if (sql.startsWith("SELECT key, json FROM store")) return ok([...store].map(([key, json]) => ({ key, json })));
     if (sql.startsWith("INSERT INTO store")) {
       store.set(params[0], params[1]);
@@ -193,6 +194,7 @@ try {
   const pasted = await post("/api/finish", { provider: "pastedmock", code: "good-code" }, bearer);
   check("a login completed on the deployed dashboard", pasted.status === 200 && pasted.json().ok === true, pasted.text().slice(0, 100));
   check("that token went to D1 rather than only to /tmp", String(store.get("token:pastedmock")).includes('"provider":"pastedmock"'));
+  store.set("login:device:kiro", JSON.stringify({ provider: "kiro", clientId: "aws-client", clientSecret: "aws-secret", deviceCode: "aws-device-code", verifyUrl: "https://example.test/device", userCode: "ABCD-EFGH", startedAt: Date.now() - 16 * 60_000 }));
   await post("/api/disconnect", { provider: "okmock" }, bearer);
   check("disconnect removes the row from D1", !store.has("token:okmock"));
   const afterDrop = (await get("/api/summary", bearer)).json();
@@ -223,6 +225,9 @@ console.log(await hit("/", jar));
 const seen = JSON.parse(await hit("/api/summary", jar, true));
 console.log(seen.providers.find((p) => p.id === "pastedmock")?.connected === true);
 console.log(String(seen.providers.find((p) => p.id === "okmock")?.connected));
+const statusReq = Readable.from([Buffer.from(JSON.stringify({provider:"kiro"}))]);
+statusReq.method="POST";statusReq.url="/api/login-status";statusReq.headers={host:"x.vercel.app",cookie:jar,authorization:"Bearer ${PASSWORD}","content-type":"application/json"};
+const statusRes=new R();const statusDone=new Promise((r)=>statusRes.on("finish",r));await h(statusReq,statusRes);await statusDone;const status=JSON.parse(Buffer.concat(statusRes.parts).toString());console.log("STATUS:" + statusRes.status);console.log("EXPIRED:" + (status.pending === false && status.connected === false));
 `], { env: process.env });
     let out = "";
     let err = "";
@@ -233,6 +238,7 @@ console.log(String(seen.providers.find((p) => p.id === "okmock")?.connected));
   const coldLines = cold.out.trim().split(/\r?\n/);
   check("a fresh instance accepts the session cookie", cold.code === 0 && coldLines[0] === "200" && coldLines[1] === "200", (cold.err || cold.out).trim().split(/\r?\n/).slice(-2).join(" ").slice(0, 160));
   check("a cold instance reads the token straight out of D1", coldLines[2] === "true" && coldLines[3] === "false", coldLines.join(" | "));
+  check("a cold instance detects and cleans expired Kiro device session from D1", coldLines.some((l) => l === "STATUS:200") && coldLines.some((l) => l === "EXPIRED:true"), coldLines.slice(4).join(" | "));
 
   // ---- a local gateway links into the very same database --------------------------------
   // The point of the store table: a provider linked in the process that *can* keep a poller
