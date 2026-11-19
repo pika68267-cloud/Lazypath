@@ -111,7 +111,11 @@ try {
   check("all-model page requires login", (await get("/model")).status === 302);
   check("provider model page requires login", (await get("/model/groq")).status === 302);
   check("chat needs a login", (await post("/v1/chat/completions", { model: "smart", messages: [] })).status === 401);
-  check("connect needs a login", (await post("/api/connect", { provider: "groq" })).status === 401);
+  const copilotLogin = await post("/api/connect", { provider: "copilot" }, bearer);
+  check("Copilot device login can start on serverless with D1", copilotLogin.status === 200 && copilotLogin.json().kind === "device" && copilotLogin.json().polling === true, copilotLogin.text().slice(0, 140));
+  const copilotStatus = await post("/api/login-status", { provider: "copilot" }, bearer);
+  check("Copilot device login status is polled server-side", copilotStatus.status === 200 && typeof copilotStatus.json().pending === "boolean");
+  check("other serverless device flow is still refused", (await post("/api/connect", { provider: "kiro" }, bearer)).status === 400);
   check("disconnect needs a login", (await post("/api/disconnect", { provider: "okmock" })).status === 401);
 
   // ---- env-managed deployments do not offer sign-up ---------------------------
@@ -160,7 +164,7 @@ try {
   check("basic auth serves a chat", basicChat.status === 200 && basicChat.json().choices?.[0]?.message?.content === "hello from mock", basicChat.text().slice(0, 120));
 
   // ---- logins that need a live process are refused, with a way forward ------
-  for (const id of ["kimi", "copilot", "gitlab", "anthropic"]) {
+  for (const id of ["kimi", "gitlab", "anthropic"]) {
     const r = await post("/api/connect", { provider: id }, bearer);
     const msg = r.json().error?.message ?? "";
     check(`${id} login refused on serverless`, r.status === 400 && msg.includes("lazypath export"), msg.slice(0, 90));

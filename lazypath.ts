@@ -4354,6 +4354,7 @@ try{var _saved=JSON.parse(localStorage.getItem("lp_chat")||"null");if(_saved&&_s
 var LPMARK='<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="2" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg>';
 function setMode(m){
   MODE=m;localStorage.lp_mode=m;
+  if(MODEL_PAGE){location.href="/";return}
   ["connect","chat","api"].forEach(function(x){
     var b=document.getElementById("m-"+x);
     if(b)b.className="mbtn"+(x===m?" sel":"");
@@ -4404,7 +4405,7 @@ function renderProviderDetail(p){
   if(p.connected){
     connection.innerHTML='<div class="wait">Account connected'+(p.expiresAt?' · token refreshes automatically':'')+'.</div><div class="mrow"><button class="ghost" onclick="act(\'disconnect\',{provider:\''+esc(p.id)+'\'}).then(function(){load(true)})">Disconnect</button></div>';
   }else if(p.login==="device"){
-    connection.innerHTML='<div class="wait">Sign in to '+esc(p.label)+' to use its models through Lazypath.</div><div class="mrow"><button onclick="connect(\''+esc(p.id)+'\')">Connect account</button></div>';
+    connection.innerHTML='<div class="wait">Sign in to '+esc(p.label)+' to use its models through Lazypath. Approval is completed on GitHub; the resulting provider token is saved to the configured shared store.</div><div class="mrow"><button id="provider-login-start" onclick="startProviderLogin(\''+esc(p.id)+'\')">Connect account</button></div>';
   }else if(p.login==="cookie"){
     connection.innerHTML=(p.site?'<div class="mrow"><a class="btn" href="'+esc(p.site)+'" target="_blank" rel="noopener">Open provider site</a></div>':'')+'<div class="wait">'+esc(p.hint||"Sign in on the provider site, then supply its session cookie.")+'</div><div class="mrow"><textarea id="provider-paste" placeholder="Paste provider cookie"></textarea></div><button onclick="finishProvider(\''+esc(p.id)+'\')">Save cookie</button>';
   }else{
@@ -4418,6 +4419,25 @@ async function finishProvider(id){
   if(!field)return;
   await act("finish",{provider:id,code:field.value});
   load(true);
+}
+async function startProviderLogin(id){
+  var status=document.getElementById("provider-status");
+  status.textContent="Starting provider login…";
+  try{
+    var r=await fetch("/api/connect",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({provider:id})});
+    var j=await r.json().catch(function(){return{}});
+    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+    if(j.alreadyConnected){status.textContent="Provider already connected.";await load(true);return;}
+    var tab=window.open("about:blank","_blank");
+    if(tab)tab.location.href=j.verifyUrl;
+    status.textContent="Approve the device code in GitHub. Keep this page open while it checks for approval.";
+    if(!tab)status.textContent+=" Login link: "+j.verifyUrl;
+    if(j.polling)pollProviderLogin(id);
+    else if(j.verifyUrl){
+      var link=document.createElement("a");link.href=j.verifyUrl;link.target="_blank";link.rel="noopener";link.textContent="Open GitHub device login";status.appendChild(document.createTextNode(" "));status.appendChild(link);
+      pollProviderLogin(id);
+    }
+  }catch(e){status.textContent="Could not start login: "+e.message;var button=document.getElementById("provider-login-start");if(button)button.disabled=false;}
 }
 async function syncProviderToCloud(){
   var status=document.getElementById("provider-sync-status");
@@ -4439,13 +4459,34 @@ async function checkProvider(){
   try{
     var r=await fetch("/api/provider/"+encodeURIComponent(PAGE_PROVIDER)),j=await r.json();
     if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
-    var provider=S&&S.providers.find(function(p){return p.id===PAGE_PROVIDER});
-    if(!provider)throw new Error("Provider is no longer in the catalog");
-    provider.connected=!!j.connected;
-    renderProviderDetail(provider);
-    document.getElementById("provider-modelhint").textContent=(j.models||[]).length+" models in provider catalog";
-    status.textContent=j.connected?"Provider status checked.":"Catalog loaded; connect provider to use these models.";
+    var latest=(j.models||[]).map(function(m){return m.id});
+    var configured=(S&&S.providers.find(function(p){return p.id===PAGE_PROVIDER})||{models:[]}).models.map(function(m){return m.id});
+    var added=latest.filter(function(m){return configured.indexOf(m)<0});
+    var removed=configured.filter(function(m){return latest.indexOf(m)<0});
+    document.getElementById("provider-modelhint").textContent=latest.length+" upstream models · "+added.length+" new · "+removed.length+" no longer listed";
+    document.getElementById("provider-modellist").innerHTML=latest.map(function(id){return '<div class="provider-model-item"><code>'+esc(PAGE_PROVIDER+"/"+id)+'</code><span class="wait">'+(added.indexOf(id)>=0?"New upstream model":"Available")+'</span></div>'}).join("")||'<div class="wait">No model catalog available.</div>';
+    status.textContent=j.connected?"Provider connection and model catalog checked.":"Model catalog checked; provider is not connected.";
   }catch(e){status.textContent="Check failed: "+e.message;}
+}
+async function pollProviderLogin(id){
+  var status=document.getElementById("provider-status");
+  var button=document.getElementById("provider-login-start");
+  if(button)button.disabled=true;
+  status.textContent="Waiting for GitHub approval…";
+  var started=Date.now();
+  try{
+    while(Date.now()-started<15*60*1000){
+      await new Promise(function(resolve){setTimeout(resolve,3000)});
+      var r=await fetch("/api/login-status",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({provider:id})});
+      var j=await r.json().catch(function(){return{}});
+      if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+      if(j.connected){status.textContent="Connected — saved to the shared provider store.";await load(true);return;}
+      if(!j.pending){status.textContent=j.expired?"Login expired. Start again to get a new code.":"Login was not completed.";if(button)button.disabled=false;return;}
+      status.textContent="Waiting for GitHub approval…";
+    }
+    status.textContent="Login expired. Start again to get a new code.";
+  }catch(e){status.textContent="Login check failed: "+e.message;}
+  if(button)button.disabled=false;
 }
 function renderAllModels(){
   if(!S)return;
@@ -5524,7 +5565,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       if (url.pathname === "/api/connect") {
         if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
         if (tokenStore()[provider.id]) return json(res, 200, { alreadyConnected: true });
-        if (SERVERLESS && (provider.login === "device" || STATEFUL_PASTE.has(provider.id))) {
+        if (SERVERLESS && (STATEFUL_PASTE.has(provider.id) || (provider.login === "device" && provider.id !== "copilot"))) {
           return json(res, 400, {
             error: {
               message: D1
@@ -5536,6 +5577,10 @@ async function route(req: IncomingMessage, res: ServerResponse) {
         try {
           const session = await startLogin(provider);
           if (session.kind === "device") {
+            if (SERVERLESS && provider.id === "copilot") {
+              activeLogins.set(provider.id, { session, startedAt: Date.now() });
+              return json(res, 200, { kind: "device", verifyUrl: session.verifyUrl, userCode: session.userCode, polling: true });
+            }
             watchDeviceLogin(provider.id, session);
             return json(res, 200, { kind: "device", verifyUrl: session.verifyUrl, userCode: session.userCode });
           }
@@ -5560,6 +5605,34 @@ async function route(req: IncomingMessage, res: ServerResponse) {
           pasteSessions.delete(provider!.id);
           return json(res, 200, { ok: true });
         } catch (e) {
+          return json(res, 502, { error: { message: String(e) } });
+        }
+      }
+      if (url.pathname === "/api/login-status") {
+        if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
+        const login = activeLogins.get(provider.id);
+        if (!login) return json(res, 200, { pending: false, connected: !!tokenStore()[provider.id] });
+        if (login.session.kind !== "device") {
+          activeLogins.delete(provider.id);
+          return json(res, 409, { error: { message: "this provider does not use a device-code login" } });
+        }
+        if (Date.now() - login.startedAt > 15 * 60_000) {
+          if (login.timer) clearInterval(login.timer);
+          activeLogins.delete(provider.id);
+          return json(res, 200, { pending: false, connected: !!tokenStore()[provider.id], expired: true });
+        }
+        try {
+          const token = await login.session.poll();
+          if (token) {
+            if (login.timer) clearInterval(login.timer);
+            activeLogins.delete(provider.id);
+            await flushTokens();
+            return json(res, 200, { pending: false, connected: true });
+          }
+          return json(res, 200, { pending: true, connected: false });
+        } catch (e) {
+          if (login.timer) clearInterval(login.timer);
+          activeLogins.delete(provider.id);
           return json(res, 502, { error: { message: String(e) } });
         }
       }
