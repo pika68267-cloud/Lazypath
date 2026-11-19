@@ -138,9 +138,25 @@ function writeJson(file: string, value: unknown) {
 }
 
 const DEFAULT_PRESETS: Presets = {
-  smart: ["kimi", "minimax", "copilot", "qwen"],
-  fast: ["qwen", "copilot", "kimi"],
-  cheap: ["qwen", "kimi", "minimax"],
+  smart: [
+    "kimi",
+    "copilot",
+    "qwen",
+    "minimax",
+    "groq", "openrouter", "deepseek", "xai", "google", "nvidia",
+    "sambanova", "deepinfra", "modelscope", "novita", "together"
+  ],
+  // Fast routing: prioritize low-latency providers
+  fast: [
+    "groq", "deepseek", "qwen", "google", "openrouter",
+    "copilot", "kimi", "minimax"
+  ],
+  // Cheap routing: free tiers first, paid last
+  cheap: [
+    "qwen", "kimi", "minimax", "groq", "modelscope",
+    "openrouter:free", "google:free", "sambanova:free",
+    "deepseek", "xai", "copilot", "kimi-for-coding"
+  ],
 };
 
 function loadConfig(): Config {
@@ -4117,7 +4133,7 @@ const HTML = String.raw`<!doctype html>
   <div class="tabs" id="sniptabs"></div>
   <div class="card snip"><pre id="snip"></pre><button class="ghost cpyb" onclick="copyPre('snip',this)">copy</button></div>
   <h2>Models <span class="meta">- what you can put in the model field</span></h2>
-  <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button class="ghost" onclick="testKey()">Checking</button><button class="ghost" onclick="checkAllModels()">All models check</button><span class="wait" id="tstat"></span></div>
+      <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button class="ghost" onclick="testKey()">Checking</button><button class="ghost" onclick="checkAllModels()">All models check</button><span class="wait" id="tstat"></span></div>
   <div class="card"><div class="wait" id="modelhint"></div><pre id="modellist" style="margin-top:8px"></pre></div>
 </section>
 
@@ -4360,12 +4376,13 @@ function initProviderPage(){
   if(!p)return;
   document.getElementById("panel-connect").hidden=true;
   document.getElementById("panel-provider").hidden=false;
-      S.providers.forEach(function(p){p.connected=models.some(function(m){return m.owned_by===p.id&&m.connected})});
-      renderAllModels();
-    }
-  }catch(e){status.textContent="Check failed: "+e.message;}
+  document.getElementById("provider-title").textContent=p.label;
+  document.getElementById("provider-description").textContent=p.connected?"Connected provider · "+p.group:"Not connected · "+p.group;
+  document.getElementById("provider-modelhint").textContent=p.models.length+" configured models";
+  document.getElementById("provider-modellist").textContent=p.models.map(function(m){return PAGE_PROVIDER+"/"+m.id}).join("\n");
 }
 async function checkProvider(){
+  var status=document.getElementById("provider-status");status.textContent="Checking provider models...";
   try{
     var r=await fetch("/model/"+encodeURIComponent(PAGE_PROVIDER)),j=await r.json();
     if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
