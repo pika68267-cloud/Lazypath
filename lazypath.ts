@@ -4040,7 +4040,7 @@ const HTML = String.raw`<!doctype html>
   <div class="sbrand"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect width="24" height="24" rx="6" fill="#0b0f16" stroke="#232c3d"/><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="1.8" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg><span>lazy<b>path</b></span></div>
   <nav class="snav">
     <button class="mbtn sel" id="m-connect" onclick="setMode('connect')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 7V3M15 7V3M8 10h8v4a4 4 0 0 1-8 0v-4zM12 18v3"/></svg>Connect</button>
-    <button class="mbtn" id="m-chat" onclick="setMode('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3c-1.3 0-2.6-.3-3.6-.9L4 20l1.2-4A8 8 0 1 1 21 11"/></svg>Chat</button>
+    <button class="mbtn" id="m-models" onclick="location.href='/model'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>Models</button>
     <button class="mbtn" id="m-models" onclick="location.href='/model'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>Models</button>
     <button class="mbtn" id="m-api" onclick="setMode('api')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/></svg>API</button>
   </nav>
@@ -4117,7 +4117,7 @@ const HTML = String.raw`<!doctype html>
   <div class="tabs" id="sniptabs"></div>
   <div class="card snip"><pre id="snip"></pre><button class="ghost cpyb" onclick="copyPre('snip',this)">copy</button></div>
   <h2>Models <span class="meta">- what you can put in the model field</span></h2>
-  <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button class="ghost" onclick="checkAllModels()">Checking all models</button><span class="wait" id="tstat"></span></div>
+  <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button class="ghost" onclick="testKey()">Checking</button><button class="ghost" onclick="checkAllModels()">All models check</button><span class="wait" id="tstat"></span></div>
   <div class="card"><div class="wait" id="modelhint"></div><pre id="modellist" style="margin-top:8px"></pre></div>
 </section>
 
@@ -4338,8 +4338,21 @@ var MODEL_PAGE=document.body.getAttribute("data-page")==="model";
 function initProviderPage(){
   if(MODEL_PAGE){
     document.getElementById("panel-connect").hidden=true;
-    document.getElementById("panel-models").hidden=false;
-    renderAllModels();
+    document.getElementById("panel-api").hidden=true;
+    document.getElementById("panel-provider").hidden=true;
+    document.getElementById("panel-chat").hidden=true;
+    if(PAGE_PROVIDER){
+      var provider=S&&S.providers.find(function(x){return x.id===PAGE_PROVIDER});
+      if(!provider)return;
+      document.getElementById("panel-provider").hidden=false;
+      document.getElementById("provider-title").textContent=provider.label;
+      document.getElementById("provider-description").textContent=provider.connected?"Connected provider · "+provider.group:"Not connected · "+provider.group;
+      document.getElementById("provider-modelhint").textContent=provider.models.length+" configured models";
+      document.getElementById("provider-modellist").textContent=provider.models.map(function(m){return PAGE_PROVIDER+"/"+m.id}).join("\n");
+    }else{
+      document.getElementById("panel-models").hidden=false;
+      renderAllModels();
+    }
     return;
   }
   if(!PAGE_PROVIDER)return;
@@ -4355,13 +4368,12 @@ function initProviderPage(){
 async function checkProvider(){
   try{
     var r=await fetch("/model/"+encodeURIComponent(PAGE_PROVIDER)),j=await r.json();
-    var r=await fetch("/v1/models"),j=await r.json();
+    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
     var models=j.models||[];
     document.getElementById("provider-description").textContent=j.connected?"Connected provider":"Not connected yet";
     document.getElementById("provider-modelhint").textContent=models.length+" configured models · "+(j.connected?"provider connected":"provider not connected");
     document.getElementById("provider-modellist").textContent=models.map(function(m){return PAGE_PROVIDER+"/"+m.id}).join("\n")||"No models configured.";
     status.textContent=j.connected?"Provider connection OK":"Models listed; connect provider to use them";
-    status.textContent=models.length?models.length+" models available":"Provider not connected";
   }catch(e){status.textContent="Check failed: "+e.message;}
 }
 function renderAllModels(){
@@ -4371,7 +4383,7 @@ function renderAllModels(){
   }).join("");
 }
 async function checkAllModels(){
-  var status=document.getElementById("models-status");status.textContent="Checking all models...";
+  var status=document.getElementById(MODEL_PAGE?"models-status":"tstat");status.textContent="Checking all models...";
   try{
     var r=await fetch("/v1/models"),j=await r.json();
     if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
@@ -5358,13 +5370,13 @@ async function route(req: IncomingMessage, res: ServerResponse) {
         res.writeHead(302, { location: "/signin" });
         return res.end();
       }
-      const isModelPage = url.pathname === "/model" || url.pathname.startsWith("/model/");
       const pageId = url.pathname === "/model" ? "" : url.pathname.slice("/model/".length).split("/")[0];
-      if (isModelPage && (!pageId || providerById(pageId))) {
+      if (!pageId || providerById(pageId)) {
         const title = !pageId ? "Models" : providerById(pageId)!.label;
-        return html(res, 200, HTML.replace("<title>lazypath</title>", `<title>${title.replace(/[&<>"']/g, "") } · lazypath</title>`)
+        return html(res, 200, HTML.replace("<title>lazypath</title>", `<title>${title.replace(/[&<>"']/g, "")} · lazypath</title>`)
           .replace("<body>", `<body data-page="model" data-provider="${pageId}">`));
       }
+      return json(res, 404, { error: { message: "unknown provider" } });
     }
     if ((url.pathname === "/signin" || url.pathname === "/") && req.method === "POST") {
       // POST, not GET: a password in the query string lands in request logs and history.
@@ -5426,7 +5438,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(302, { location: "/", "set-cookie": "lp_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" });
       return res.end();
     }
-    if (!(await authed(req)) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models" || url.pathname === "/model" || url.pathname.startsWith("/model/"))) {
+    if (!(await authed(req)) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models")) {
       return json(res, 401, { error: { message: "bad lazypath login" } });
     }
     // With D1 the database holds the tokens, so refresh this request's view of it once,

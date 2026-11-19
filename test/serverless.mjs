@@ -108,6 +108,8 @@ try {
   check("a password in the query string does not sign in", (await get(`/?password=${PASSWORD}`)).text().includes('href="/signin"'));
   check("summary needs a login", (await get("/api/summary")).status === 401);
   check("model list needs a login", (await get("/v1/models")).status === 401);
+  check("all-model page requires login", (await get("/model")).status === 302);
+  check("provider model page requires login", (await get("/model/groq")).status === 302);
   check("chat needs a login", (await post("/v1/chat/completions", { model: "smart", messages: [] })).status === 401);
   check("connect needs a login", (await post("/api/connect", { provider: "groq" })).status === 401);
   check("disconnect needs a login", (await post("/api/disconnect", { provider: "okmock" })).status === 401);
@@ -133,6 +135,13 @@ try {
   const jar = { cookie: `lp_session=${session}` };
   const dash = await get("/", jar);
   check("cookie opens the dashboard", dash.status === 200 && dash.text().includes('id="groups"'));
+  const allModelsPage = await get("/model", jar);
+  check("all-model page serves the model browser", allModelsPage.status === 200 && allModelsPage.text().includes('data-page="model"') && allModelsPage.text().includes("Check all models"));
+  const providerModelsPage = await get("/model/groq", jar);
+  check("provider model page renders its models panel", providerModelsPage.status === 200 && providerModelsPage.text().includes('data-provider="groq"') && providerModelsPage.text().includes("Check models"));
+  const providerModelsApi = await get("/model/groq", jar);
+  check("provider model API returns provider catalog page", providerModelsApi.status === 200 && providerModelsApi.text().includes('data-provider="groq"'));
+  check("unknown provider model page is not found", (await get("/model/no-such-provider", jar)).status === 404);
   const viaCookie = await summary(jar);
   check("cookie authenticates the api", viaCookie.serverless === true);
   check("summary reports the account mode and public flag", viaCookie.accountMode === "local" && viaCookie.public === true);
