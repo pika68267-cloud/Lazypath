@@ -3981,7 +3981,20 @@ const HTML = String.raw`<!doctype html>
   .sfoot{margin-top:auto;padding:12px 16px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);display:flex;flex-direction:column;gap:9px}
   .sfoot button{width:100%}
   main#main{flex:1;min-width:0;max-width:none;padding:0;margin:0}
-  #panel-connect,#panel-api{max-width:1080px;margin:0 auto;padding:26px 18px 70px}
+   #panel-connect,#panel-api,#panel-models,#panel-provider{max-width:1080px;margin:0 auto;padding:26px 18px 70px}
+   #panel-models[hidden],#panel-provider[hidden]{display:none}
+   .provider-detail-head{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+   .provider-detail-head .av{width:52px;height:52px;border-radius:15px}
+   .provider-detail-head h1{font-size:24px}
+   .provider-detail-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(250px,1fr);gap:16px}
+   .provider-detail-grid h2{margin-top:0}
+   .provider-model-item{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}
+   .provider-model-item:last-child{border-bottom:0}
+   .provider-model-item code{font-size:12px;overflow-wrap:anywhere}
+   .provider-state{display:inline-flex;align-items:center;gap:7px;color:var(--dim);font-size:12px}
+   .provider-state i{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+   .provider-state.connected i{background:var(--ok)}
+   @media(max-width:760px){.provider-detail-grid{grid-template-columns:1fr}#panel-models,#panel-provider{padding:16px 12px 60px}}
   .chatwrap{display:flex;flex-direction:column;height:100vh;max-width:860px;margin:0 auto;width:100%}
   .chatwrap[hidden]{display:none}
   .chathead{display:flex;gap:9px;align-items:center;padding:11px 16px;border-bottom:1px solid var(--line)}
@@ -4056,7 +4069,7 @@ const HTML = String.raw`<!doctype html>
   <div class="sbrand"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect width="24" height="24" rx="6" fill="#0b0f16" stroke="#232c3d"/><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="1.8" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg><span>lazy<b>path</b></span></div>
   <nav class="snav">
     <button class="mbtn sel" id="m-connect" onclick="setMode('connect')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 7V3M15 7V3M8 10h8v4a4 4 0 0 1-8 0v-4zM12 18v3"/></svg>Connect</button>
-    <button class="mbtn" id="m-models" onclick="location.href='/model'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>Models</button>
+    <button class="mbtn" id="m-chat" onclick="setMode('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Chat</button>
     <button class="mbtn" id="m-models" onclick="location.href='/model'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>Models</button>
     <button class="mbtn" id="m-api" onclick="setMode('api')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/></svg>API</button>
   </nav>
@@ -4133,23 +4146,24 @@ const HTML = String.raw`<!doctype html>
   <div class="tabs" id="sniptabs"></div>
   <div class="card snip"><pre id="snip"></pre><button class="ghost cpyb" onclick="copyPre('snip',this)">copy</button></div>
   <h2>Models <span class="meta">- what you can put in the model field</span></h2>
-      <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button class="ghost" onclick="testKey()">Checking</button><button class="ghost" onclick="checkAllModels()">All models check</button><span class="wait" id="tstat"></span></div>
+  <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button class="ghost" onclick="testKey()">Checking</button><span class="wait" id="tstat"></span></div>
   <div class="card"><div class="wait" id="modelhint"></div><pre id="modellist" style="margin-top:8px"></pre></div>
 </section>
 
 <section id="panel-models" hidden>
   <h1>Models</h1>
-  <div class="sub">Browse all configured provider models. Select a provider to see its models.</div>
+  <div class="sub">Browse provider catalogs and open a provider for its model and connection details.</div>
   <div class="mrow"><button onclick="checkAllModels()">Check all models</button><span class="wait" id="models-status"></span></div>
   <div id="models-by-provider"></div>
 </section>
 
 <section id="panel-provider" hidden>
-  <h1 id="provider-title">Provider</h1>
-  <div class="sub" id="provider-description">Provider models and connection status.</div>
-  <h2>Models</h2>
-  <div class="mrow"><button class="ghost" onclick="location.href='/model'">All models</button><button onclick="checkProvider()">Check models</button><span class="wait" id="provider-status"></span></div>
-  <div class="card"><div class="wait" id="provider-modelhint"></div><pre id="provider-modellist" style="margin-top:8px"></pre></div>
+  <div class="provider-detail-head"><span id="provider-avatar"></span><div><h1 id="provider-title">Provider</h1><div class="sub" id="provider-description">Provider information and model catalog.</div></div></div>
+  <div class="mrow"><button class="ghost" onclick="location.href='/model'">← All providers</button><span class="provider-state" id="provider-state"><i></i><span id="provider-state-label">Checking status…</span></span></div>
+  <div class="provider-detail-grid">
+    <div class="card"><div class="row"><h2 style="margin:0">Models</h2><button class="ghost" onclick="checkProvider()">Refresh models</button></div><div class="wait" id="provider-modelhint" style="margin-top:10px"></div><div id="provider-modellist" style="margin-top:8px"></div><div class="wait" id="provider-status" aria-live="polite"></div></div>
+    <div class="card"><h2>Connection</h2><div id="provider-connection"></div><div class="msec" id="provider-usage"></div></div>
+  </div>
 </section>
 
 </main>
@@ -4361,10 +4375,7 @@ function initProviderPage(){
       var provider=S&&S.providers.find(function(x){return x.id===PAGE_PROVIDER});
       if(!provider)return;
       document.getElementById("panel-provider").hidden=false;
-      document.getElementById("provider-title").textContent=provider.label;
-      document.getElementById("provider-description").textContent=provider.connected?"Connected provider · "+provider.group:"Not connected · "+provider.group;
-      document.getElementById("provider-modelhint").textContent=provider.models.length+" configured models";
-      document.getElementById("provider-modellist").textContent=provider.models.map(function(m){return PAGE_PROVIDER+"/"+m.id}).join("\n");
+      renderProviderDetail(provider);
     }else{
       document.getElementById("panel-models").hidden=false;
       renderAllModels();
@@ -4376,27 +4387,51 @@ function initProviderPage(){
   if(!p)return;
   document.getElementById("panel-connect").hidden=true;
   document.getElementById("panel-provider").hidden=false;
+  renderProviderDetail(p);
+}
+function renderProviderDetail(p){
   document.getElementById("provider-title").textContent=p.label;
-  document.getElementById("provider-description").textContent=p.connected?"Connected provider · "+p.group:"Not connected · "+p.group;
-  document.getElementById("provider-modelhint").textContent=p.models.length+" configured models";
-  document.getElementById("provider-modellist").textContent=p.models.map(function(m){return PAGE_PROVIDER+"/"+m.id}).join("\n");
+  document.getElementById("provider-avatar").innerHTML=av(p,"av av-big");
+  document.getElementById("provider-description").textContent=p.group+" · "+(p.trust==="official"?"official integration":p.trust==="community"?"community integration":"web login");
+  document.getElementById("provider-state").className="provider-state"+(p.connected?" connected":"");
+  document.getElementById("provider-state-label").textContent=p.connected?"Connected":"Not connected";
+  document.getElementById("provider-usage").textContent=p.usage.requests+" requests · "+p.usage.ok+" successful · "+p.usage.failed+" failed";
+  var connection=document.getElementById("provider-connection");
+  if(p.connected){
+    connection.innerHTML='<div class="wait">Account connected'+(p.expiresAt?' · token refreshes automatically':'')+'.</div><div class="mrow"><button class="ghost" onclick="act(\'disconnect\',{provider:\''+esc(p.id)+'\'}).then(function(){load(true)})">Disconnect</button></div>';
+  }else if(p.login==="device"){
+    connection.innerHTML='<div class="wait">Sign in to '+esc(p.label)+' to use its models through Lazypath.</div><div class="mrow"><button onclick="connect(\''+esc(p.id)+'\')">Connect account</button></div>';
+  }else if(p.login==="cookie"){
+    connection.innerHTML=(p.site?'<div class="mrow"><a class="btn" href="'+esc(p.site)+'" target="_blank" rel="noopener">Open provider site</a></div>':'')+'<div class="wait">'+esc(p.hint||"Sign in on the provider site, then supply its session cookie.")+'</div><div class="mrow"><textarea id="provider-paste" placeholder="Paste provider cookie"></textarea></div><button onclick="finishProvider(\''+esc(p.id)+'\')">Save cookie</button>';
+  }else{
+    connection.innerHTML=(p.site?'<div class="mrow"><a class="btn" href="'+esc(p.site)+'" target="_blank" rel="noopener">Open provider site</a></div>':'')+'<div class="wait">'+esc(p.hint||"Connect using the provider login flow.")+'</div><div class="mrow"><textarea id="provider-paste" placeholder="Paste key or login code"></textarea></div><button onclick="connect(\''+esc(p.id)+'\')">Start connection</button><button class="ghost" onclick="finishProvider(\''+esc(p.id)+'\')">Finish</button>';
+  }
+  document.getElementById("provider-modelhint").textContent=p.models.length+" models in catalog";
+  document.getElementById("provider-modellist").innerHTML=p.models.map(function(m){return '<div class="provider-model-item"><code>'+esc(p.id+"/"+m.id)+'</code></div>'}).join("")||'<div class="wait">No models in catalog.</div>';
+}
+async function finishProvider(id){
+  var field=document.getElementById("provider-paste");
+  if(!field)return;
+  await act("finish",{provider:id,code:field.value});
+  load(true);
 }
 async function checkProvider(){
   var status=document.getElementById("provider-status");status.textContent="Checking provider models...";
   try{
     var r=await fetch("/model/"+encodeURIComponent(PAGE_PROVIDER)),j=await r.json();
     if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
-    var models=j.models||[];
-    document.getElementById("provider-description").textContent=j.connected?"Connected provider":"Not connected yet";
-    document.getElementById("provider-modelhint").textContent=models.length+" configured models · "+(j.connected?"provider connected":"provider not connected");
-    document.getElementById("provider-modellist").textContent=models.map(function(m){return PAGE_PROVIDER+"/"+m.id}).join("\n")||"No models configured.";
-    status.textContent=j.connected?"Provider connection OK":"Models listed; connect provider to use them";
+    var provider=S&&S.providers.find(function(p){return p.id===PAGE_PROVIDER});
+    if(!provider)throw new Error("Provider is no longer in the catalog");
+    provider.connected=!!j.connected;
+    renderProviderDetail(provider);
+    document.getElementById("provider-modelhint").textContent=(j.models||[]).length+" models in provider catalog";
+    status.textContent=j.connected?"Provider status checked.":"Catalog loaded; connect provider to use these models.";
   }catch(e){status.textContent="Check failed: "+e.message;}
 }
 function renderAllModels(){
   if(!S)return;
   document.getElementById("models-by-provider").innerHTML=S.providers.map(function(p){
-    return '<div class="card" style="margin:10px 0"><div class="row"><div class="grow"><strong>'+esc(p.label)+'</strong><div class="wait">'+(p.connected?'Connected':'Not connected')+' · '+p.models.length+' models</div></div><a class="btn" href="/model/'+encodeURIComponent(p.id)+'">Open models</a></div><pre style="margin:10px 0 0">'+p.models.map(function(m){return esc(p.id+"/"+m.id)}).join("\n")+'</pre></div>';
+    return '<div class="card" style="margin:10px 0"><div class="row">'+av(p)+'<div class="grow"><strong>'+esc(p.label)+'</strong><div class="wait">'+(p.connected?'Connected':'Not connected')+' · '+p.models.length+' models</div></div><a class="btn" href="/model/'+encodeURIComponent(p.id)+'">Provider details</a></div><div class="wait" style="margin:10px 0 0">'+esc(p.group)+' · '+esc(p.trust==="official"?"official integration":p.trust==="community"?"community integration":"web login")+'</div></div>';
   }).join("");
 }
 async function checkAllModels(){

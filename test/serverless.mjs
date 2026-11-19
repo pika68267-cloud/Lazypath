@@ -139,7 +139,7 @@ try {
   check("all-model page serves the model browser", allModelsPage.status === 200 && allModelsPage.text().includes('data-page="model"') && allModelsPage.text().includes("Check all models"));
   check("all-model page client opens the all-model panel", allModelsPage.text().includes('if(MODEL_PAGE){') && allModelsPage.text().includes('document.getElementById("panel-models").hidden=false'));
   const providerModelsPage = await get("/model/groq", jar);
-  check("provider model page renders its models panel", providerModelsPage.status === 200 && providerModelsPage.text().includes('data-provider="groq"') && providerModelsPage.text().includes("Check models"));
+  check("provider model page renders its detail panel", providerModelsPage.status === 200 && providerModelsPage.text().includes('data-provider="groq"') && providerModelsPage.text().includes("Refresh models") && providerModelsPage.text().includes("Connection"));
   const providerModelsApi = await get("/model/groq", jar);
   check("provider model API returns provider catalog page", providerModelsApi.status === 200 && providerModelsApi.text().includes('data-provider="groq"'));
   check("unknown provider model page is not found", (await get("/model/no-such-provider", jar)).status === 404);
