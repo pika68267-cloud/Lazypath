@@ -2040,16 +2040,28 @@ function fromResponses(raw: string, model: string) {
   let text = "";
   const usage = { input: 0, output: 0 };
   const events = raw.includes("data:") ? sseData(raw) : [JSON.parse(raw) as Record<string, unknown>];
+  if (!raw || raw.trim() === "") {
+    throw new Error("Responses API returned empty response");
+  }
   for (const evt of events) {
     const type = String(evt.type ?? "");
     if (type === "response.output_text.delta") text += String(evt.delta ?? "");
     if (type === "response.completed" || !type) {
       const resp = (evt.response ?? evt) as Record<string, unknown>;
+      if (!resp || typeof resp !== "object") {
+        throw new Error("Responses API returned invalid response object");
+      }
       if (!text) text = responseText(resp);
       const u = (resp.usage ?? {}) as Record<string, unknown>;
+      if (typeof u !== "object" || u === null) {
+        throw new Error("Responses API returned invalid usage object");
+      }
       usage.input = Number(u.input_tokens ?? usage.input);
       usage.output = Number(u.output_tokens ?? usage.output);
     }
+  }
+  if (!text && !usage.input && !usage.output) {
+    throw new Error("Responses API returned no content");
   }
   return {
     id: "lazypath",
@@ -2076,6 +2088,9 @@ function huggingchatText(raw: string): string {
 
 function fromHuggingchat(raw: string, model: string) {
   const text = huggingchatText(raw);
+  if (!raw || raw.trim() === "") {
+    throw new Error("HuggingChat returned empty response");
+  }
   return {
     id: "lazypath",
     object: "chat.completion",
