@@ -509,9 +509,27 @@ const REAL_PROVIDERS: ProviderDef[] = [
       { id: "minimax-m3", label: "MiniMax M3" },
     ],
   },
-  // Codex (ChatGPT) removed - GPT-6 models return 400 model_not_found
-  // when using a ChatGPT account via Codex. The ChatGPT account doesn't support
-  // the gpt-6-astra or gpt-6-astra-high models.
+  {
+    id: "codex",
+    label: "ChatGPT (Codex)",
+    color: "#7a9dff",
+    logo: MARKS.codex ?? null,
+    monogram: "O",
+    login: "device",
+    trust: "official",
+    group: "Device code",
+    inference: {
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      format: "responses",
+      headers: { originator: "codex_cli_rs", version: "0.46.0" },
+    },
+    models: [
+      { id: "gpt-4.1", label: "GPT-4.1" },
+      { id: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
+      { id: "gpt-4o", label: "GPT-4o" },
+      { id: "gpt-4o-mini", label: "GPT-4o Mini" },
+    ],
+  },
   {
     id: "grok",
     label: "Grok (xAI)",
@@ -3939,6 +3957,7 @@ const HTML = String.raw`<!doctype html>
   .sbrand svg{width:22px;height:22px;flex:none}
   .sbrand b{color:var(--acc);font-weight:600}
   .snav{display:flex;flex-direction:column;gap:2px;padding:4px 10px}
+  .snav a.mbtn{text-decoration:none}
   .mbtn{display:flex;align-items:center;gap:10px;background:transparent;color:var(--dim);border:0;border-radius:8px;padding:9px 11px;font:inherit;font-size:13.5px;cursor:pointer;text-align:left}
   .mbtn:hover{background:var(--card2);color:var(--txt)}
   .mbtn.sel{background:rgba(94,234,212,.1);color:var(--acc);font-weight:500}
@@ -4021,7 +4040,8 @@ const HTML = String.raw`<!doctype html>
   <div class="sbrand"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect width="24" height="24" rx="6" fill="#0b0f16" stroke="#232c3d"/><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="1.8" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg><span>lazy<b>path</b></span></div>
   <nav class="snav">
     <button class="mbtn sel" id="m-connect" onclick="setMode('connect')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 7V3M15 7V3M8 10h8v4a4 4 0 0 1-8 0v-4zM12 18v3"/></svg>Connect</button>
-    <button class="mbtn" id="m-chat" onclick="setMode('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3c-1.3 0-2.6-.3-3.6-.9L4 20l1.2-4A8 8 0 1 1 21 11.5z"/></svg>Chat</button>
+    <button class="mbtn" id="m-chat" onclick="setMode('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3c-1.3 0-2.6-.3-3.6-.9L4 20l1.2-4A8 8 0 1 1 21 11"/></svg>Chat</button>
+    <button class="mbtn" id="m-thingy" onclick="location.href='/thingy'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>Thingy</button>
     <button class="mbtn" id="m-api" onclick="setMode('api')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/></svg>API</button>
   </nav>
   <div class="sfoot">
@@ -4097,8 +4117,24 @@ const HTML = String.raw`<!doctype html>
   <div class="tabs" id="sniptabs"></div>
   <div class="card snip"><pre id="snip"></pre><button class="ghost cpyb" onclick="copyPre('snip',this)">copy</button></div>
   <h2>Models <span class="meta">- what you can put in the model field</span></h2>
+  <div class="mrow"><button class="ghost" onclick="location.href='/thingy'">/model</button><button class="ghost" onclick="testKey()">Checking</button><span class="wait" id="tstat"></span></div>
   <div class="card"><div class="wait" id="modelhint"></div><pre id="modellist" style="margin-top:8px"></pre></div>
-  <div class="mrow"><button onclick="testKey()">Test connection</button><span class="wait" id="tstat"></span></div>
+</section>
+
+<section id="panel-thingy" hidden>
+  <h1>Thingy</h1>
+  <div class="sub">Model list and gateway connection check.</div>
+  <h2>Models</h2>
+  <div class="card"><div class="wait" id="thingy-modelhint"></div><pre id="thingy-modellist" style="margin-top:8px"></pre></div>
+  <div class="mrow"><button onclick="checkThingy()">Checking</button><span class="wait" id="thingy-status"></span></div>
+</section>
+
+<section id="panel-provider" hidden>
+  <h1 id="provider-title">Provider</h1>
+  <div class="sub" id="provider-description">Provider models and connection status.</div>
+  <h2>Models</h2>
+  <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button onclick="checkProvider()">Checking</button><span class="wait" id="provider-status"></span></div>
+  <div class="card"><div class="wait" id="provider-modelhint"></div><pre id="provider-modellist" style="margin-top:8px"></pre></div>
 </section>
 
 </main>
@@ -4289,13 +4325,85 @@ try{var _saved=JSON.parse(localStorage.getItem("lp_chat")||"null");if(_saved&&_s
 var LPMARK='<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="2" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg>';
 function setMode(m){
   MODE=m;localStorage.lp_mode=m;
-  ["connect","chat","api"].forEach(function(x){
-    document.getElementById("m-"+x).className="mbtn"+(x===m?" sel":"");
+  ["connect","chat","api","thingy"].forEach(function(x){
+    var b=document.getElementById("m-"+x);
+    if(b)b.className="mbtn"+(x===m?" sel":"");
     var p=document.getElementById("panel-"+x);
-    if(x===m)p.removeAttribute("hidden");else p.setAttribute("hidden","");
+    if(p){if(x===m)p.removeAttribute("hidden");else p.setAttribute("hidden","");}
   });
   if(m==="chat"){renderChat();var t=document.getElementById("cinput");if(t&&!CHAT.busy)t.focus()}
   if(m==="api")renderApi(true);
+}
+async function checkThingy(){
+  var status=document.getElementById("thingy-status");
+  status.textContent="Checking models...";
+  try{
+    var r=await fetch("/v1/models");
+    var j=await r.json();
+    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+    var ids=(j.data||[]).map(function(m){return m.id});
+    document.getElementById("thingy-modelhint").textContent=ids.length+" models available";
+    document.getElementById("thingy-modellist").textContent=ids.join("\n");
+    status.textContent="Connection OK";
+  }catch(e){status.textContent="Check failed: "+e.message;}
+}
+var PAGE_PROVIDER=decodeURIComponent(location.pathname.replace(/^\/+/,""));
+function initProviderPage(){
+  if(!PAGE_PROVIDER||PAGE_PROVIDER==="thingy")return;
+  if(PAGE_PROVIDER==="model"){
+    document.getElementById("panel-connect").hidden=true;
+    document.getElementById("panel-thingy").hidden=false;
+    document.querySelector("#panel-thingy h1").textContent="Models";
+    checkThingy();
+    return;
+  }
+  var p=S&&S.providers.find(function(x){return x.id===PAGE_PROVIDER});
+  if(!p)return;
+  document.getElementById("panel-connect").hidden=true;
+  document.getElementById("panel-provider").hidden=false;
+  document.getElementById("provider-title").textContent=p.label;
+  document.getElementById("provider-description").textContent=p.connected?"Connected provider · "+p.group:"Not connected · "+p.group;
+  var models=p.models.map(function(m){return p.id+"/"+m.id});
+  document.getElementById("provider-modelhint").textContent=models.length+" models available";
+  document.getElementById("provider-modellist").textContent=models.join("\n");
+}
+async function checkProvider(){
+  var status=document.getElementById("provider-status");
+  status.textContent="Checking connection...";
+  try{
+    var r=await fetch("/v1/models");
+    var j=await r.json();
+    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+    var prefix=PAGE_PROVIDER+"/";
+    var models=(j.data||[]).map(function(m){return m.id}).filter(function(id){return id.indexOf(prefix)===0});
+    document.getElementById("provider-modelhint").textContent=models.length+" available models from "+PAGE_PROVIDER;
+    document.getElementById("provider-modellist").textContent=models.join("\n")||"No models currently available. Connect this provider first.";
+    status.textContent=models.length?"Connection OK":"Provider not connected";
+  }catch(e){status.textContent="Check failed: "+e.message;}
+}
+var PAGE_PROVIDER=decodeURIComponent(location.pathname.replace(/^\/+/,""));
+function initProviderPage(){
+  if(!PAGE_PROVIDER||PAGE_PROVIDER==="thingy"||PAGE_PROVIDER==="model")return;
+  var p=S&&S.providers.find(function(x){return x.id===PAGE_PROVIDER});
+  if(!p)return;
+  document.getElementById("panel-connect").hidden=true;
+  document.getElementById("panel-provider").hidden=false;
+  document.getElementById("provider-title").textContent=p.label;
+  document.getElementById("provider-description").textContent=p.connected?"Connected provider · "+p.group:"Not connected · "+p.group;
+  var models=p.models.map(function(m){return p.id+"/"+m.id});
+  document.getElementById("provider-modelhint").textContent=models.length+" models available";
+  document.getElementById("provider-modellist").textContent=models.join("\n");
+}
+async function checkProvider(){
+  var status=document.getElementById("provider-status");status.textContent="Checking connection...";
+  try{
+    var r=await fetch("/v1/models"),j=await r.json();
+    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+    var prefix=PAGE_PROVIDER+"/",models=(j.data||[]).map(function(m){return m.id}).filter(function(id){return id.indexOf(prefix)===0});
+    document.getElementById("provider-modelhint").textContent=models.length+" available models from "+PAGE_PROVIDER;
+    document.getElementById("provider-modellist").textContent=models.join("\n")||"No models currently available. Connect this provider first.";
+    status.textContent=models.length?"Connection OK":"Provider not connected";
+  }catch(e){status.textContent="Check failed: "+e.message;}
 }
 function modelOpts(){
   var sel=document.getElementById("cmodel");if(!S||!sel)return;
@@ -4510,7 +4618,7 @@ async function testKey(){
   var j=await r.json().catch(function(){return{}});
   st.textContent=r.ok?((j.data||[]).length+" models reachable"):"failed: "+((j.error&&j.error.message)||("HTTP "+r.status));
 }
-load().then(function(){setMode(MODE)});
+load().then(function(){setMode(MODE);initProviderPage()});
 setInterval(function(){load()},3000);
 </script>
 </body>
@@ -5272,6 +5380,18 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       if (await authed(req)) return html(res, 200, HTML);
       return html(res, 200, homePage());
     }
+    if (req.method === "GET" && url.pathname !== "/" && url.pathname !== "/model" && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/v1/") && !url.pathname.startsWith("/signin") && !url.pathname.startsWith("/signup") && !url.pathname.startsWith("/signout")) {
+      if (!(await authed(req))) {
+        res.writeHead(302, { location: "/signin" });
+        return res.end();
+      }
+      const pageId = url.pathname.slice(1);
+      if (pageId === "thingy" || pageId === "model" || providerById(pageId)) {
+        const title = pageId === "thingy" ? "Thingy" : pageId === "model" ? "Models" : providerById(pageId)!.label;
+        return html(res, 200, HTML.replace("<title>lazypath</title>", `<title>${title.replace(/[&<>"']/g, "") } · lazypath</title>`)
+          .replace("<body>", `<body data-page="${pageId}">`));
+      }
+    }
     if ((url.pathname === "/signin" || url.pathname === "/") && req.method === "POST") {
       // POST, not GET: a password in the query string lands in request logs and history.
       const form = new URLSearchParams(await readBody(req));
@@ -5441,6 +5561,18 @@ async function route(req: IncomingMessage, res: ServerResponse) {
 
     if (url.pathname === "/v1/models") {
       return json(res, 200, { object: "list", data: listAllModels().map((m) => ({ id: m.id, object: "model", owned_by: m.owned_by })) });
+    }
+
+    if (url.pathname.startsWith("/model/")) {
+      const providerId = url.pathname.slice(7).split("/")[0];
+      const provider = providerById(providerId);
+      if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
+      return json(res, 200, { 
+        provider: provider.id,
+        label: provider.label,
+        models: provider.models.map((m) => ({ id: m.id, label: m.label })),
+        connected: !!tokenStore()[provider.id]
+      });
     }
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
