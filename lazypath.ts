@@ -4041,7 +4041,7 @@ const HTML = String.raw`<!doctype html>
   <nav class="snav">
     <button class="mbtn sel" id="m-connect" onclick="setMode('connect')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 7V3M15 7V3M8 10h8v4a4 4 0 0 1-8 0v-4zM12 18v3"/></svg>Connect</button>
     <button class="mbtn" id="m-chat" onclick="setMode('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3c-1.3 0-2.6-.3-3.6-.9L4 20l1.2-4A8 8 0 1 1 21 11"/></svg>Chat</button>
-    <button class="mbtn" id="m-thingy" onclick="location.href='/thingy'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>Thingy</button>
+    <button class="mbtn" id="m-models" onclick="location.href='/model'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>Models</button>
     <button class="mbtn" id="m-api" onclick="setMode('api')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/></svg>API</button>
   </nav>
   <div class="sfoot">
@@ -4117,23 +4117,22 @@ const HTML = String.raw`<!doctype html>
   <div class="tabs" id="sniptabs"></div>
   <div class="card snip"><pre id="snip"></pre><button class="ghost cpyb" onclick="copyPre('snip',this)">copy</button></div>
   <h2>Models <span class="meta">- what you can put in the model field</span></h2>
-  <div class="mrow"><button class="ghost" onclick="location.href='/thingy'">/model</button><button class="ghost" onclick="testKey()">Checking</button><span class="wait" id="tstat"></span></div>
+  <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button class="ghost" onclick="checkAllModels()">Checking all models</button><span class="wait" id="tstat"></span></div>
   <div class="card"><div class="wait" id="modelhint"></div><pre id="modellist" style="margin-top:8px"></pre></div>
 </section>
 
-<section id="panel-thingy" hidden>
-  <h1>Thingy</h1>
-  <div class="sub">Model list and gateway connection check.</div>
-  <h2>Models</h2>
-  <div class="card"><div class="wait" id="thingy-modelhint"></div><pre id="thingy-modellist" style="margin-top:8px"></pre></div>
-  <div class="mrow"><button onclick="checkThingy()">Checking</button><span class="wait" id="thingy-status"></span></div>
+<section id="panel-models" hidden>
+  <h1>Models</h1>
+  <div class="sub">Browse all configured provider models. Select a provider to see its models.</div>
+  <div class="mrow"><button onclick="checkAllModels()">Check all models</button><span class="wait" id="models-status"></span></div>
+  <div id="models-by-provider"></div>
 </section>
 
 <section id="panel-provider" hidden>
   <h1 id="provider-title">Provider</h1>
   <div class="sub" id="provider-description">Provider models and connection status.</div>
   <h2>Models</h2>
-  <div class="mrow"><button class="ghost" onclick="location.href='/model'">/model</button><button onclick="checkProvider()">Checking</button><span class="wait" id="provider-status"></span></div>
+  <div class="mrow"><button class="ghost" onclick="location.href='/model'">All models</button><button onclick="checkProvider()">Check models</button><span class="wait" id="provider-status"></span></div>
   <div class="card"><div class="wait" id="provider-modelhint"></div><pre id="provider-modellist" style="margin-top:8px"></pre></div>
 </section>
 
@@ -4325,7 +4324,7 @@ try{var _saved=JSON.parse(localStorage.getItem("lp_chat")||"null");if(_saved&&_s
 var LPMARK='<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="2" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg>';
 function setMode(m){
   MODE=m;localStorage.lp_mode=m;
-  ["connect","chat","api","thingy"].forEach(function(x){
+  ["connect","chat","api"].forEach(function(x){
     var b=document.getElementById("m-"+x);
     if(b)b.className="mbtn"+(x===m?" sel":"");
     var p=document.getElementById("panel-"+x);
@@ -4334,75 +4333,49 @@ function setMode(m){
   if(m==="chat"){renderChat();var t=document.getElementById("cinput");if(t&&!CHAT.busy)t.focus()}
   if(m==="api")renderApi(true);
 }
-async function checkThingy(){
-  var status=document.getElementById("thingy-status");
-  status.textContent="Checking models...";
-  try{
-    var r=await fetch("/v1/models");
-    var j=await r.json();
-    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
-    var ids=(j.data||[]).map(function(m){return m.id});
-    document.getElementById("thingy-modelhint").textContent=ids.length+" models available";
-    document.getElementById("thingy-modellist").textContent=ids.join("\n");
-    status.textContent="Connection OK";
-  }catch(e){status.textContent="Check failed: "+e.message;}
-}
-var PAGE_PROVIDER=decodeURIComponent(location.pathname.replace(/^\/+/,""));
+var PAGE_PROVIDER=decodeURIComponent(document.body.getAttribute("data-provider")||"");
+var MODEL_PAGE=document.body.getAttribute("data-page")==="model";
 function initProviderPage(){
-  if(!PAGE_PROVIDER||PAGE_PROVIDER==="thingy")return;
-  if(PAGE_PROVIDER==="model"){
+  if(MODEL_PAGE){
     document.getElementById("panel-connect").hidden=true;
-    document.getElementById("panel-thingy").hidden=false;
-    document.querySelector("#panel-thingy h1").textContent="Models";
-    checkThingy();
+    document.getElementById("panel-models").hidden=false;
+    renderAllModels();
     return;
   }
+  if(!PAGE_PROVIDER)return;
   var p=S&&S.providers.find(function(x){return x.id===PAGE_PROVIDER});
   if(!p)return;
   document.getElementById("panel-connect").hidden=true;
   document.getElementById("panel-provider").hidden=false;
-  document.getElementById("provider-title").textContent=p.label;
-  document.getElementById("provider-description").textContent=p.connected?"Connected provider · "+p.group:"Not connected · "+p.group;
-  var models=p.models.map(function(m){return p.id+"/"+m.id});
-  document.getElementById("provider-modelhint").textContent=models.length+" models available";
-  document.getElementById("provider-modellist").textContent=models.join("\n");
-}
-async function checkProvider(){
-  var status=document.getElementById("provider-status");
-  status.textContent="Checking connection...";
-  try{
-    var r=await fetch("/v1/models");
-    var j=await r.json();
-    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
-    var prefix=PAGE_PROVIDER+"/";
-    var models=(j.data||[]).map(function(m){return m.id}).filter(function(id){return id.indexOf(prefix)===0});
-    document.getElementById("provider-modelhint").textContent=models.length+" available models from "+PAGE_PROVIDER;
-    document.getElementById("provider-modellist").textContent=models.join("\n")||"No models currently available. Connect this provider first.";
-    status.textContent=models.length?"Connection OK":"Provider not connected";
+      S.providers.forEach(function(p){p.connected=models.some(function(m){return m.owned_by===p.id&&m.connected})});
+      renderAllModels();
+    }
   }catch(e){status.textContent="Check failed: "+e.message;}
 }
-var PAGE_PROVIDER=decodeURIComponent(location.pathname.replace(/^\/+/,""));
-function initProviderPage(){
-  if(!PAGE_PROVIDER||PAGE_PROVIDER==="thingy"||PAGE_PROVIDER==="model")return;
-  var p=S&&S.providers.find(function(x){return x.id===PAGE_PROVIDER});
-  if(!p)return;
-  document.getElementById("panel-connect").hidden=true;
-  document.getElementById("panel-provider").hidden=false;
-  document.getElementById("provider-title").textContent=p.label;
-  document.getElementById("provider-description").textContent=p.connected?"Connected provider · "+p.group:"Not connected · "+p.group;
-  var models=p.models.map(function(m){return p.id+"/"+m.id});
-  document.getElementById("provider-modelhint").textContent=models.length+" models available";
-  document.getElementById("provider-modellist").textContent=models.join("\n");
-}
 async function checkProvider(){
-  var status=document.getElementById("provider-status");status.textContent="Checking connection...";
+  try{
+    var r=await fetch("/model/"+encodeURIComponent(PAGE_PROVIDER)),j=await r.json();
+    var r=await fetch("/v1/models"),j=await r.json();
+    var models=j.models||[];
+    document.getElementById("provider-description").textContent=j.connected?"Connected provider":"Not connected yet";
+    document.getElementById("provider-modelhint").textContent=models.length+" configured models · "+(j.connected?"provider connected":"provider not connected");
+    document.getElementById("provider-modellist").textContent=models.map(function(m){return PAGE_PROVIDER+"/"+m.id}).join("\n")||"No models configured.";
+    status.textContent=j.connected?"Provider connection OK":"Models listed; connect provider to use them";
+    status.textContent=models.length?models.length+" models available":"Provider not connected";
+  }catch(e){status.textContent="Check failed: "+e.message;}
+}
+function renderAllModels(){
+  if(!S)return;
+  document.getElementById("models-by-provider").innerHTML=S.providers.map(function(p){
+    return '<div class="card" style="margin:10px 0"><div class="row"><div class="grow"><strong>'+esc(p.label)+'</strong><div class="wait">'+(p.connected?'Connected':'Not connected')+' · '+p.models.length+' models</div></div><a class="btn" href="/model/'+encodeURIComponent(p.id)+'">Open models</a></div><pre style="margin:10px 0 0">'+p.models.map(function(m){return esc(p.id+"/"+m.id)}).join("\n")+'</pre></div>';
+  }).join("");
+}
+async function checkAllModels(){
+  var status=document.getElementById("models-status");status.textContent="Checking all models...";
   try{
     var r=await fetch("/v1/models"),j=await r.json();
     if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
-    var prefix=PAGE_PROVIDER+"/",models=(j.data||[]).map(function(m){return m.id}).filter(function(id){return id.indexOf(prefix)===0});
-    document.getElementById("provider-modelhint").textContent=models.length+" available models from "+PAGE_PROVIDER;
-    document.getElementById("provider-modellist").textContent=models.join("\n")||"No models currently available. Connect this provider first.";
-    status.textContent=models.length?"Connection OK":"Provider not connected";
+    status.textContent=(j.data||[]).length+" models available across all providers";
   }catch(e){status.textContent="Check failed: "+e.message;}
 }
 function modelOpts(){
@@ -5380,16 +5353,17 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       if (await authed(req)) return html(res, 200, HTML);
       return html(res, 200, homePage());
     }
-    if (req.method === "GET" && url.pathname !== "/" && url.pathname !== "/model" && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/v1/") && !url.pathname.startsWith("/signin") && !url.pathname.startsWith("/signup") && !url.pathname.startsWith("/signout") && url.pathname.indexOf(".")<0) {
+    if (req.method === "GET" && (url.pathname === "/model" || url.pathname.startsWith("/model/"))) {
       if (!(await authed(req))) {
         res.writeHead(302, { location: "/signin" });
         return res.end();
       }
-      const pageId = url.pathname.slice(1);
-      if (pageId === "thingy" || pageId === "model" || providerById(pageId)) {
-        const title = pageId === "thingy" ? "Thingy" : pageId === "model" ? "Models" : providerById(pageId)!.label;
+      const isModelPage = url.pathname === "/model" || url.pathname.startsWith("/model/");
+      const pageId = url.pathname === "/model" ? "" : url.pathname.slice("/model/".length).split("/")[0];
+      if (isModelPage && (!pageId || providerById(pageId))) {
+        const title = !pageId ? "Models" : providerById(pageId)!.label;
         return html(res, 200, HTML.replace("<title>lazypath</title>", `<title>${title.replace(/[&<>"']/g, "") } · lazypath</title>`)
-          .replace("<body>", `<body data-page="${pageId}">`));
+          .replace("<body>", `<body data-page="model" data-provider="${pageId}">`));
       }
     }
     if ((url.pathname === "/signin" || url.pathname === "/") && req.method === "POST") {
@@ -5452,7 +5426,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(302, { location: "/", "set-cookie": "lp_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" });
       return res.end();
     }
-    if (!(await authed(req)) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models")) {
+    if (!(await authed(req)) && (url.pathname.startsWith("/api/") || url.pathname === "/v1/models" || url.pathname === "/model" || url.pathname.startsWith("/model/"))) {
       return json(res, 401, { error: { message: "bad lazypath login" } });
     }
     // With D1 the database holds the tokens, so refresh this request's view of it once,
@@ -5561,6 +5535,10 @@ async function route(req: IncomingMessage, res: ServerResponse) {
 
     if (url.pathname === "/v1/models") {
       return json(res, 200, { object: "list", data: listAllModels().map((m) => ({ id: m.id, object: "model", owned_by: m.owned_by })) });
+    }
+
+    if (url.pathname === "/model") {
+      return json(res, 200, { object: "list", data: listAllModels().map((m) => ({ id: m.id, object: "model", owned_by: m.owned_by, connected: m.connected })) });
     }
 
     if (url.pathname.startsWith("/model/")) {
