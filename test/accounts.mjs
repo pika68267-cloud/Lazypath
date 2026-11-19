@@ -225,10 +225,12 @@ console.log(await hit("/", jar));
 const seen = JSON.parse(await hit("/api/summary", jar, true));
 console.log(seen.providers.find((p) => p.id === "pastedmock")?.connected === true);
 console.log(String(seen.providers.find((p) => p.id === "okmock")?.connected));
+// First verify the cookie still works before changing the simulated D1 rows below.
 const statusReq = Readable.from([Buffer.from(JSON.stringify({provider:"kiro"}))]);
 statusReq.method="POST";statusReq.url="/api/login-status";statusReq.headers={host:"x.vercel.app",cookie:jar,authorization:"Bearer ${PASSWORD}","content-type":"application/json"};
 const statusRes=new R();const statusDone=new Promise((r)=>statusRes.on("finish",r));await h(statusReq,statusRes);await statusDone;const status=JSON.parse(Buffer.concat(statusRes.parts).toString());console.log("STATUS:" + statusRes.status);console.log("EXPIRED:" + (status.pending === false && status.connected === false));
-`], { env: process.env });
+`
+], { env: process.env });
     let out = "";
     let err = "";
     child.stdout.on("data", (c) => (out += c));
@@ -239,6 +241,14 @@ const statusRes=new R();const statusDone=new Promise((r)=>statusRes.on("finish",
   check("a fresh instance accepts the session cookie", cold.code === 0 && coldLines[0] === "200" && coldLines[1] === "200", (cold.err || cold.out).trim().split(/\r?\n/).slice(-2).join(" ").slice(0, 160));
   check("a cold instance reads the token straight out of D1", coldLines[2] === "true" && coldLines[3] === "false", coldLines.join(" | "));
   check("a cold instance detects and cleans expired Kiro device session from D1", coldLines.some((l) => l === "STATUS:200") && coldLines.some((l) => l === "EXPIRED:true"), coldLines.slice(4).join(" | "));
+
+  // A token that reached D1 must win over a stale pending device row in the same DB:
+  // otherwise a fresh instance keeps reporting "pending" after approval and the UI hangs.
+  store.set("token:kiro", JSON.stringify({ provider: "kiro", accessToken: "cloud-token", authMode: "oauth" }));
+  store.set("login:device:kiro", JSON.stringify({ provider: "kiro", clientId: "aws-client", clientSecret: "aws-secret", deviceCode: "aws-device-code", verifyUrl: "https://example.test/device", userCode: "ABCD-EFGH", startedAt: Date.now() }));
+  const finished = await post("/api/login-status", { provider: "kiro" }, bearer);
+  check("a finished login no longer hangs on a stale D1 device row", finished.status === 200 && finished.json().pending === false && finished.json().connected === true, finished.text().slice(0, 160));
+  check("completion clears the temporary device row", !store.has("login:device:kiro"));
 
   // ---- a local gateway links into the very same database --------------------------------
   // The point of the store table: a provider linked in the process that *can* keep a poller

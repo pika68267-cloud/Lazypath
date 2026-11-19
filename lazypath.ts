@@ -363,6 +363,14 @@ async function deletePendingDeviceLogin(provider: string): Promise<void> {
   }
 }
 
+/** A serverless instance can disappear between the browser starting a login and polling
+ *  its result. On the next poll the new instance must not try to start a second device
+ *  session: that invalidates the code the user is approving and leaves the page hanging.
+ *  If a provider already has a token, the login is over regardless of stale session rows. */
+function loginAlreadyConnected(provider: string): boolean {
+  return !!tokenStore()[provider];
+}
+
 const emptyRow = (): UsageRow => ({ requests: 0, ok: 0, failed: 0, inputTokens: 0, outputTokens: 0, lastUsedAt: 0 });
 
 function recordUsage(provider: string, ok: boolean, inputTokens: number, outputTokens: number) {
@@ -1292,6 +1300,7 @@ async function form(url: string, fields: Record<string, string>, headers: Record
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json", ...headers },
     body: new URLSearchParams(fields),
+    signal: AbortSignal.timeout(20000),
   });
   const text = await res.text();
   let body: Record<string, unknown> = {};
@@ -1316,6 +1325,7 @@ async function jsonPost(url: string, value: unknown, headers: Record<string, str
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json", ...headers },
     body: JSON.stringify(value),
+    signal: AbortSignal.timeout(20000),
   });
   const text = await res.text();
   let body: Record<string, unknown> = {};
@@ -1501,7 +1511,10 @@ async function startLogin(provider: ProviderDef): Promise<LoginSession> {
   // ---- device-code family -------------------------------------------------
   if (provider.login === "device") {
     if (SERVERLESS && D1 && ["kiro", "codex", "grok"].includes(provider.id)) {
-      const pending = await startPersistentDeviceLogin(provider.id as PendingDeviceLogin["provider"]);
+      // Resume an in-flight D1 session instead of minting a second device code:
+      // a duplicate start invalidates the code the user is already approving.
+      const existing = await readPendingDeviceLogin(provider.id);
+      const pending = existing ?? await startPersistentDeviceLogin(provider.id as PendingDeviceLogin["provider"]);
       return createPersistentDeviceSession(pending);
     }
     if (provider.id.endsWith("mock")) {
@@ -4448,8 +4461,11 @@ function connect(id){
       if(r.kind==="device")p.pending={userCode:r.userCode||"",verifyUrl:r.verifyUrl};
       else if(r.url)p.loginUrl=r.url;
     });
+    // On serverless there is no long-lived server timer: the browser must keep calling
+    // /api/login-status or the device code is never exchanged and the card hangs on "waiting".
+    if(r.polling)pollDashboardLogin(id);
     load(true);
-  });
+  }).catch(function(){if(tab)tab.close()});
 }
 function copyCode(c,el){navigator.clipboard.writeText(c);if(el)el.textContent="copied"}
 async function finish(id){
@@ -4461,10 +4477,38 @@ async function copyKey(){if(S.password)navigator.clipboard.writeText(S.password)
 async function signOut(){await fetch("/signout",{method:"POST"});location.href="/"}
 async function load(force){
   var s=await(await fetch("/api/summary")).json();
+  // Summary from a cold instance has an empty activeLogins map, so it drops pending.
+  // Keep the in-browser waiting state while we are still polling the exchange.
+  if(S&&S.providers){
+    S.providers.forEach(function(old){
+      if(!POLLING[old.id]||!old.pending)return;
+      var next=s.providers.find(function(p){return p.id===old.id});
+      if(next&&!next.connected&&!next.pending)next.pending=old.pending;
+    });
+  }
   var sig=JSON.stringify(s);
   S=s;
   if(!force&&sig===load.last)return;   // unchanged: skip rebuild so modals stay put
   load.last=sig;render();
+}
+var POLLING={};
+async function pollDashboardLogin(id){
+  if(POLLING[id])return;
+  POLLING[id]=true;
+  var started=Date.now();
+  try{
+    while(Date.now()-started<15*60*1000){
+      await new Promise(function(resolve){setTimeout(resolve,3000)});
+      var r=await fetch("/api/login-status",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({provider:id})});
+      var j=await r.json().catch(function(){return{}});
+      if(r.status===401){location.href="/signin";return}
+      if(!r.ok)continue;
+      if(j.connected){delete POLLING[id];await load(true);return;}
+      if(!j.pending){delete POLLING[id];await load(true);return;}
+    }
+  }catch(e){}
+  delete POLLING[id];
+  await load(true);
 }
 // ---------------------------------------------------------------- three modes: connect / chat / api
 var MODE=localStorage.getItem("lp_mode")||"connect";
@@ -4525,7 +4569,7 @@ function renderProviderDetail(p){
   if(p.connected){
     connection.innerHTML='<div class="wait">Account connected'+(p.expiresAt?' · token refreshes automatically':'')+'.</div><div class="mrow"><button class="ghost" onclick="act(\'disconnect\',{provider:\''+esc(p.id)+'\'}).then(function(){load(true)})">Disconnect</button></div>';
   }else if(p.login==="device"){
-    connection.innerHTML='<div class="wait">Sign in to '+esc(p.label)+' to use its models through Lazypath. Approval is completed on GitHub; the resulting provider token is saved to the configured shared store.</div><div class="mrow"><button id="provider-login-start" onclick="startProviderLogin(\''+esc(p.id)+'\')">Connect account</button></div>';
+    connection.innerHTML='<div class="wait">Sign in to '+esc(p.label)+' to use its models through Lazypath. The resulting provider token is saved to the configured shared store.</div><div class="mrow"><button id="provider-login-start" onclick="startProviderLogin(\''+esc(p.id)+'\')">Connect account</button></div>';
   }else if(p.login==="cookie"){
     connection.innerHTML=(p.site?'<div class="mrow"><a class="btn" href="'+esc(p.site)+'" target="_blank" rel="noopener">Open provider site</a></div>':'')+'<div class="wait">'+esc(p.hint||"Sign in on the provider site, then supply its session cookie.")+'</div><div class="mrow"><textarea id="provider-paste" placeholder="Paste provider cookie"></textarea></div><button onclick="finishProvider(\''+esc(p.id)+'\')">Save cookie</button>';
   }else{
@@ -4543,6 +4587,8 @@ async function finishProvider(id){
 async function startProviderLogin(id){
   var status=document.getElementById("provider-status");
   status.textContent="Starting provider login…";
+  var button=document.getElementById("provider-login-start");
+  if(button)button.disabled=true;
   try{
     var r=await fetch("/api/connect",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({provider:id})});
     var j=await r.json().catch(function(){return{}});
@@ -4550,14 +4596,15 @@ async function startProviderLogin(id){
     if(j.alreadyConnected){status.textContent="Provider already connected.";await load(true);return;}
     var tab=window.open("about:blank","_blank");
     if(tab)tab.location.href=j.verifyUrl;
-    status.textContent="Approve the device code in GitHub. Keep this page open while it checks for approval.";
+    status.textContent="Approve the device code in "+esc((S.providers.find(function(p){return p.id===id})||{label:id}).label)+". Keep this page open while it checks for approval.";
     if(!tab)status.textContent+=" Login link: "+j.verifyUrl;
+    watchProviderConnection(id);
     if(j.polling)pollProviderLogin(id);
     else if(j.verifyUrl){
-      var link=document.createElement("a");link.href=j.verifyUrl;link.target="_blank";link.rel="noopener";link.textContent="Open GitHub device login";status.appendChild(document.createTextNode(" "));status.appendChild(link);
+      var link=document.createElement("a");link.href=j.verifyUrl;link.target="_blank";link.rel="noopener";link.textContent="Open device login";status.appendChild(document.createTextNode(" "));status.appendChild(link);
       pollProviderLogin(id);
     }
-  }catch(e){status.textContent="Could not start login: "+e.message;var button=document.getElementById("provider-login-start");if(button)button.disabled=false;}
+  }catch(e){status.textContent="Could not start login: "+e.message;if(button)button.disabled=false;}
 }
 async function syncProviderToCloud(){
   var status=document.getElementById("provider-sync-status");
@@ -4592,21 +4639,50 @@ async function pollProviderLogin(id){
   var status=document.getElementById("provider-status");
   var button=document.getElementById("provider-login-start");
   if(button)button.disabled=true;
-  status.textContent="Waiting for GitHub approval…";
+  status.textContent="Waiting for approval…";
   var started=Date.now();
   try{
     while(Date.now()-started<15*60*1000){
       await new Promise(function(resolve){setTimeout(resolve,3000)});
       var r=await fetch("/api/login-status",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({provider:id})});
       var j=await r.json().catch(function(){return{}});
-      if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+      if(r.status===401){location.href="/signin";return}
+      if(!r.ok){
+        if(button)button.disabled=false;
+        status.textContent="Login check failed: "+((j.error&&j.error.message)||("HTTP "+r.status));
+        return;
+      }
       if(j.connected){status.textContent="Connected — saved to the shared provider store.";await load(true);return;}
       if(!j.pending){status.textContent=j.expired?"Login expired. Start again to get a new code.":"Login was not completed.";if(button)button.disabled=false;return;}
-      status.textContent="Waiting for GitHub approval…";
+      status.textContent="Waiting for approval…";
     }
     status.textContent="Login expired. Start again to get a new code.";
   }catch(e){status.textContent="Login check failed: "+e.message;}
   if(button)button.disabled=false;
+}
+
+/** The dashboard already refreshes /api/summary every three seconds. Use it, rather than
+ *  a second long-lived poller, to notice a login that finished on another instance. This
+ *  closes the gap where the token reaches D1 but the device-session poller has already
+ *  reported "not completed". */
+function watchProviderConnection(id){
+  var done=Date.now()+15*60*1000,status=document.getElementById("provider-status");
+  var timer=setInterval(function(){
+    var connected=S&&S.providers.some(function(p){return p.id===id&&p.connected});
+    if(!connected){
+      if(Date.now()<=done)return;
+      clearInterval(timer);
+      if(status&&status.textContent.indexOf("Connected")<0)status.textContent="Login expired. Start again to get a new code.";
+      var button=document.getElementById("provider-login-start");
+      if(button)button.disabled=false;
+      return;
+    }
+    clearInterval(timer);
+    if(status&&status.textContent.indexOf("Connected")<0)status.textContent="Connected — saved to the shared provider store.";
+    var button=document.getElementById("provider-login-start");
+    if(button)button.disabled=false;
+    load(true);
+  },3000);
 }
 function renderAllModels(){
   if(!S)return;
@@ -5730,6 +5806,15 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       }
       if (url.pathname === "/api/login-status") {
         if (!provider) return json(res, 404, { error: { message: "unknown provider" } });
+        // The token is the source of truth. A stale D1 session row from an instance that
+        // already finished the login must not override a saved connection with "pending".
+        if (loginAlreadyConnected(provider.id)) {
+          await deletePendingDeviceLogin(provider.id).catch(() => {});
+          const stale = activeLogins.get(provider.id);
+          if (stale?.timer) clearInterval(stale.timer);
+          activeLogins.delete(provider.id);
+          return json(res, 200, { pending: false, connected: true });
+        }
         let login = activeLogins.get(provider.id);
         if (!login && SERVERLESS && ["kiro", "codex", "grok"].includes(provider.id)) {
           try {
@@ -5750,6 +5835,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
         if (Date.now() - login.startedAt > 15 * 60_000) {
           if (login.timer) clearInterval(login.timer);
           activeLogins.delete(provider.id);
+          await deletePendingDeviceLogin(provider.id).catch(() => {});
           return json(res, 200, { pending: false, connected: !!tokenStore()[provider.id], expired: true });
         }
         try {
