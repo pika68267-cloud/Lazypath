@@ -81,6 +81,8 @@ interface Config {
   presets: Presets;
   /** set once someone claims this gateway through /signup; sign-up then closes */
   accountCreated?: boolean;
+  /** optional metadata for runtime sync state */
+  meta?: Record<string, unknown>;
 }
 
 // --------------------------------------------------------------------------- store
@@ -826,11 +828,21 @@ const REAL_PROVIDERS: ProviderDef[] = [
     hint: "One key for hundreds of models. The ids ending in :free need no credit; everything else bills per token. Create a key at openrouter.ai/settings/keys.",
     inference: { baseUrl: "https://openrouter.ai/api/v1", format: "openai" },
     models: [
+      { id: "mistralai/pixtral-large-2502", label: "Pixtral Large 2502" },
+      { id: "google/gemini-4-neon", label: "Gemini 4 Neon" },
+      { id: "openai/gpt-6.2-astra-pro", label: "GPT-6.2 Astra Pro" },
+      { id: "openai/gpt-6.2-astra", label: "GPT-6.2 Astra" },
+      { id: "openai/gpt-6.2-sol", label: "GPT-6.2 Sol" },
+      { id: "qwen/qwen4-max", label: "Qwen4 Max" },
+      { id: "inclusionai/ling-3.2-flash:free", label: "Ling 3.2 Flash (free)" },
+      { id: "google/gemini-4-hydrogen", label: "Gemini 4 Hydrogen" },
+      { id: "baidu/ernie-5.5-flash-preview:free", label: "ERNIE 5.5 Flash Preview (free)" },
+      { id: "google/gemini-4-carbon", label: "Gemini 4 Carbon" },
+      { id: "tencent/hy4-flash", label: "Hy4 Flash" },
       { id: "google/gemma-4-31b-it:free", label: "Gemma 4 31B (free)" },
       { id: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron 3 Ultra 550B (free)" },
       { id: "nvidia/nemotron-3.5-lightning:free", label: "Nemotron 3.5 Lightning (free)" },
       { id: "cohere/north-mini-code:free", label: "North Mini Code (free)" },
-      { id: "inclusionai/ling-3.2-flash:free", label: "Ling 3.2 Flash (free)" },
     ],
   },
   {
@@ -921,10 +933,11 @@ const REAL_PROVIDERS: ProviderDef[] = [
     hint: "RDU inference, very low latency. Create a key in cloud.sambanova.ai under APIs.",
     inference: { baseUrl: "https://api.sambanova.ai/v1", format: "openai" },
     models: [
-      { id: "gpt-oss-120b", label: "GPT-OSS 120B" },
       { id: "GLM-5.3", label: "GLM 5.3" },
       { id: "Meta-Llama-3.3-70B-Instruct", label: "Llama 3.3 70B" },
       { id: "MiniMax-M3.1-Flash", label: "MiniMax M3.1 Flash" },
+      { id: "gemma-4-31b-it", label: "Gemma 4 31B" },
+      { id: "gpt-oss-120b", label: "GPT-OSS 120B" },
     ],
   },
   {
@@ -940,11 +953,17 @@ const REAL_PROVIDERS: ProviderDef[] = [
     hint: "Hosted NIM endpoints. Open any model page on build.nvidia.com and use Get API Key.",
     inference: { baseUrl: "https://integrate.api.nvidia.com/v1", format: "openai" },
     models: [
+      { id: "bigcode/starcoder2-15b", label: "StarCoder2 15B" },
+      { id: "google/gemma-3-12b-it", label: "Gemma 3 12B" },
+      { id: "google/gemma-3-4b-it", label: "Gemma 3 4B" },
+      { id: "google/gemma-4-31b-it", label: "Gemma 4 31B" },
+      { id: "meta/muse-glimmer-30b", label: "Muse Glimmer 30B" },
+      { id: "minimaxai/minimax-m3.1-flash", label: "MiniMax M3.1 Flash" },
+      { id: "mistralai/mistral-large-4-1t-a52b", label: "Mistral Large 4.1T" },
+      { id: "moonshotai/kimi-k3.1-pro", label: "Kimi K3.1 Pro" },
       { id: "nvidia/nemotron-3-ultra-550b-a55b", label: "Nemotron 3 Ultra 550B" },
       { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B" },
-      { id: "google/gemma-4-31b-it", label: "Gemma 4 31B" },
       { id: "z-ai/glm-5.3-flash", label: "GLM 5.3 Flash" },
-      { id: "minimaxai/minimax-m3.1-flash", label: "MiniMax M3.1 Flash" },
     ],
   },
   {
@@ -980,11 +999,26 @@ const REAL_PROVIDERS: ProviderDef[] = [
     hint: "Alibaba's model hub inference API. Copy the access token from modelscope.cn/my/myaccesstoken.",
     inference: { baseUrl: "https://api-inference.modelscope.cn/v1", format: "openai" },
     models: [
-      { id: "Qwen/Qwen3.8-27B", label: "Qwen3.8 27B" },
+      { id: "deepseek-ai/DeepSeek-V4-Flash-0731", label: "DeepSeek V4 Flash 0731" },
+      { id: "deepseek-ai/DeepSeek-V4-Pro", label: "DeepSeek V4 Pro" },
+      { id: "deepseek-ai/DeepSeek-V4-Pro-0813", label: "DeepSeek V4 Pro 0813" },
       { id: "deepseek-ai/DeepSeek-V4.1-Flash", label: "DeepSeek V4.1 Flash" },
-      { id: "moonshotai/Kimi-K3.1-Pro", label: "Kimi K3.1 Pro" },
-      { id: "ZhipuAI/GLM-5.2", label: "GLM 5.2" },
+      { id: "deepseek-ai/DeepSeek-V4.1-Flash-1017", label: "DeepSeek V4.1 Flash 1017" },
+      { id: "early-access/EA-29B-A4B", label: "EA 29B A4B" },
+      { id: "MedAIBase/AntAngelMed", label: "AntAngelMed" },
+      { id: "meituan-longcat/LongCat-Flash-Lite", label: "LongCat Flash Lite" },
+      { id: "MiniMax/MiniMax-M1-80k", label: "MiniMax M1 80k" },
       { id: "MiniMax/MiniMax-M3", label: "MiniMax M3" },
+      { id: "mistralai/Mistral-Large-Instruct-2407", label: "Mistral Large Instruct 2407" },
+      { id: "moonshotai/Kimi-K3.1-Pro", label: "Kimi K3.1 Pro" },
+      { id: "MusePublic/Qwen-Image-Edit", label: "Qwen Image Edit" },
+      { id: "nex-agi/Nex-N2.5-mini", label: "Nex N2.5 Mini" },
+      { id: "nex-agi/Nex-N2.5-Pro", label: "Nex N2.5 Pro" },
+      { id: "opencompass/CompassJudger-1-32B-Instruct", label: "CompassJudger 1 32B" },
+      { id: "OpenGVLab/InternVL3_5-241B-A28B", label: "InternVL3.5 241B" },
+      { id: "PaddlePaddle/ERNIE-4.5-0.3B-PT", label: "ERNIE 4.5 0.3B" },
+      { id: "PaddlePaddle/ERNIE-4.5-21B-A3B-PT", label: "ERNIE 4.5 21B" },
+      { id: "PaddlePaddle/ERNIE-4.5-300B-A47B-PT", label: "ERNIE 4.5 300B" },
     ],
   },
   {
@@ -1000,11 +1034,26 @@ const REAL_PROVIDERS: ProviderDef[] = [
     hint: "Open models billed per token. Create a key at novita.ai/settings/key-management.",
     inference: { baseUrl: "https://api.novita.ai/v3/openai", format: "openai" },
     models: [
-      { id: "qwen/qwen3.8-flash", label: "Qwen3.8 Flash" },
+      { id: "tencent/hy4-flash", label: "Hy4 Flash" },
+      { id: "tencent/hy4", label: "Hy4" },
+      { id: "deepseek/deepseek-v4.1-flash-1017", label: "DeepSeek V4.1 Flash 1017" },
+      { id: "zai-org/glm-5.3-flashX", label: "GLM 5.3 FlashX" },
+      { id: "moonshotai/kimi-k3.1-pro-highspeed", label: "Kimi K3.1 Pro Highspeed" },
       { id: "moonshotai/kimi-k3.1-pro", label: "Kimi K3.1 Pro" },
+      { id: "zai-org/glm-5.3-flash", label: "GLM 5.3 Flash" },
+      { id: "xiaomimimo/mimo-v2.6-flash", label: "Mimo V2.6 Flash" },
+      { id: "xiaomimimo/mimo-v2.6-pro", label: "Mimo V2.6 Pro" },
+      { id: "tencent/hy4-preview", label: "Hy4 Preview" },
       { id: "deepseek/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash" },
       { id: "zai-org/glm-5.3", label: "GLM 5.3" },
-      { id: "minimax/minimax-m3.1-flash", label: "MiniMax M3.1 Flash" },
+      { id: "deepseek/deepseek-v4-pro-0813", label: "DeepSeek V4 Pro 0813" },
+      { id: "moonshotai/kimi-k3", label: "Kimi K3" },
+      { id: "tencent/hy3", label: "Hy3" },
+      { id: "zai-org/glm-5.2", label: "GLM 5.2" },
+      { id: "moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code" },
+      { id: "qwen/qwen3.8-flash", label: "Qwen3.8 Flash" },
+      { id: "deepseek/deepseek-v4-flash-0731", label: "DeepSeek V4 Flash 0731" },
+      { id: "mindai/macaron-v1-venti", label: "Macaron V1 Venti" },
     ],
   },
   {
@@ -1061,6 +1110,50 @@ const REAL_PROVIDERS: ProviderDef[] = [
     ],
   },
 ];
+
+/** Providers that expose a public /models endpoint (no API key required). */
+const PUBLIC_MODEL_SYNC = new Set<string>(["openrouter", "nvidia-nim", "sambanova", "novita", "modelscope"]);
+
+const MODEL_SYNC_KEY = "meta:model-sync";
+
+async function syncPublicModels(): Promise<void> {
+  if (process.env.LAZYPATH_NO_SYNC === "1") return;
+  const cfg = loadConfig();
+  const meta = cfg.meta ?? {};
+  const lastSync = (meta[MODEL_SYNC_KEY] as number) ?? 0;
+  if (Date.now() - lastSync < 24 * 60 * 60 * 1000) return;
+  const updates: Record<string, { id: string; label: string }[]> = {};
+  const endpoints: Record<string, string> = {
+    openrouter: "https://openrouter.ai/api/v1/models",
+    "nvidia-nim": "https://integrate.api.nvidia.com/v1/models",
+    sambanova: "https://api.sambanova.ai/v1/models",
+    novita: "https://api.novita.ai/v3/openai/models",
+    modelscope: "https://api-inference.modelscope.cn/v1/models",
+  };
+  for (const [pid, url] of Object.entries(endpoints)) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!r.ok) continue;
+      const j = await r.json() as { data?: { id: string; name?: string }[]; models?: { id: string; name?: string }[] };
+      const data = j.data || (Array.isArray(j.models) ? j.models : []);
+      if (!Array.isArray(data)) continue;
+      const models = data.slice(0, 200).map((m: { id: string; name?: string }) => ({
+        id: m.id || m.name || "",
+        label: m.name || m.id || "",
+      })).filter((m) => m.id);
+      if (models.length) updates[pid] = models;
+    } catch {}
+  }
+  if (Object.keys(updates).length === 0) return;
+  const patched = PROVIDERS.map((p) => {
+    const live = updates[p.id];
+    if (live) return { ...p, models: live };
+    return p;
+  });
+  (globalThis as unknown as { PROVIDERS?: ProviderDef[] }).PROVIDERS = patched;
+  cfg.meta = { ...meta, [MODEL_SYNC_KEY]: Date.now() };
+  saveConfig(cfg);
+}
 
 // Local stubs for the test harness only (LAZYPATH_MOCKS=1).
 const MOCK_PROVIDERS: ProviderDef[] = [
@@ -6126,6 +6219,7 @@ if (!SERVERLESS) {
       process.exit(0);
     }
     server.listen(PORT, HOST, async () => {
+      void syncPublicModels();
       console.log(`\n  lazypath v${VERSION} up on http://${HOST}:${PORT}`);
       console.log(`  dashboard  ${dashboard}`);
       console.log(`  openai api http://localhost:${PORT}/v1   (model: smart | fast | cheap)`);
