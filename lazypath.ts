@@ -4611,7 +4611,6 @@ try{var _saved=JSON.parse(localStorage.getItem("lp_chat")||"null");if(_saved&&_s
 var LPMARK='<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M5 16.5c4 0 3-9 7-9s3 9 7 9" stroke="#5eead4" stroke-width="2" fill="none" stroke-linecap="round"/><circle cx="5" cy="16.5" r="1.9" fill="#4cc9f0"/><circle cx="19" cy="16.5" r="1.9" fill="#ffb454"/></svg>';
 function setMode(m){
   MODE=m;localStorage.lp_mode=m;
-  if(MODEL_PAGE){location.href="/";return}
   ["connect","chat","api"].forEach(function(x){
     var b=document.getElementById("m-"+x);
     if(b)b.className="mbtn"+(x===m?" sel":"");
